@@ -325,7 +325,13 @@ def extract_request_token(handler: BaseHTTPRequestHandler, query: dict[str, list
 # ============================================================
 
 
-def build_gemini_config():
+def get_field(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def build_gemini_config(model_name: str = ""):
     from google.genai import types
 
     config_kwargs = {
@@ -337,7 +343,10 @@ def build_gemini_config():
     thinking_config_cls = getattr(types, "ThinkingConfig", None)
     if thinking_config_cls is not None:
         try:
-            config_kwargs["thinking_config"] = thinking_config_cls(thinking_level="minimal")
+            if "gemini-3" in model_name.lower():
+                config_kwargs["thinking_config"] = thinking_config_cls(thinking_level="minimal")
+            else:
+                config_kwargs["thinking_config"] = thinking_config_cls(thinking_budget=0)
         except Exception:
             pass
 
@@ -347,24 +356,44 @@ def build_gemini_config():
 
     try:
         return generate_config_cls(**config_kwargs)
-    except TypeError:
+    except Exception:
         config_kwargs.pop("thinking_config", None)
         return generate_config_cls(**config_kwargs)
 
 
+def extract_interaction_text(interaction: Any) -> str:
+    if not interaction:
+        return ""
+    text = get_field(interaction, "output_text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    steps = get_field(interaction, "steps") or []
+    for step in reversed(steps):
+        content = get_field(step, "content") or []
+        if isinstance(content, list):
+            for item in reversed(content):
+                item_text = get_field(item, "text")
+                if isinstance(item_text, str) and item_text.strip():
+                    return item_text.strip()
+    return ""
+
+
 def extract_gemini_text(response: Any) -> str:
-    response_text = getattr(response, "text", None)
+    if not response:
+        return ""
+    response_text = get_field(response, "text")
     if isinstance(response_text, str) and response_text.strip():
         return response_text.strip()
 
     parts: list[str] = []
 
-    candidates = getattr(response, "candidates", None) or []
+    candidates = get_field(response, "candidates") or []
     for candidate in candidates:
-        content = getattr(candidate, "content", None)
-        candidate_parts = getattr(content, "parts", None) or []
+        content = get_field(candidate, "content")
+        candidate_parts = get_field(content, "parts") or []
         for part in candidate_parts:
-            text = getattr(part, "text", None)
+            text = get_field(part, "text")
             if isinstance(text, str) and text.strip():
                 parts.append(text)
 
@@ -433,7 +462,7 @@ def call_gemini(user_prompt: str) -> str:
             response = client.models.generate_content(
                 model=model_name,
                 contents=user_prompt,
-                config=build_gemini_config(),
+                config=build_gemini_config(model_name),
             )
             if CONFIG.debug:
                 log_gemini_debug(response)
@@ -496,10 +525,10 @@ def transcribe_audio(audio_bytes: bytes) -> str:
                     }
                 ],
             )
-            transcript = getattr(interaction, "output_text", "") or ""
-            if isinstance(transcript, str) and transcript.strip():
-                log(f"[Transcribe] (gemini-3.5-transcribe) Result: {transcript.strip()!r}")
-                return transcript.strip()
+            transcript = extract_interaction_text(interaction)
+            if transcript:
+                log(f"[Transcribe] (gemini-3.5-transcribe) Result: {transcript!r}")
+                return transcript
         except Exception as stt_err:
             log(f"[Transcribe WARN] gemini-3.5-transcribe failed: {stt_err}. Attempting fallback...")
 
@@ -514,8 +543,8 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         stt_fallback_models = [m for m in models_to_try if not (m in seen or seen.add(m))]
 
         prompt = (
-            "Listen carefully to this audio and transcribe the speaker's words verbatim. "
-            "Output ONLY the transcribed words. Do not add quotes, explanations, or timestamps."
+            "Transcribe the speaker's words in this audio verbatim in their original language (Japanese or English). "
+            "Output ONLY the transcribed words. Do not add quotes, markdown, explanations, or timestamps."
         )
         audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
 
