@@ -21,6 +21,7 @@ STATIC_DIR = ROOT_DIR / "static"
 AUDIO_FILE_PATH = STATIC_DIR / "ram_speech.mp3"
 SERVICE_NAME = "chibi-ram-backend"
 GEMINI_MODEL_ID = "gemini-3.6-flash"
+GEMINI_TRANSCRIBE_MODEL_ID = "gemini-3.5-transcribe"
 DEFAULT_PORT = 8000
 CHAT_TOKEN_HEADER = "X-Chibi-Ram-Token"
 
@@ -243,7 +244,7 @@ def write_json(handler: BaseHTTPRequestHandler, status_code: int, payload: dict[
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Access-Control-Allow-Origin", "*")
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type, X-Chibi-Ram-Token, Authorization")
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -432,6 +433,88 @@ def call_gemini(user_prompt: str) -> str:
 
 
 # ============================================================
+# SPEECH-TO-TEXT (Gemini 3.5 Transcribe + Fallback)
+# ============================================================
+
+
+def transcribe_audio(audio_bytes: bytes) -> str:
+    if not CONFIG.gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    if not audio_bytes:
+        raise ValueError("Audio data is empty.")
+
+    log(f"[Transcribe] Processing {len(audio_bytes)} bytes of audio...")
+
+    try:
+        from google import genai
+        from google.genai import types
+    except Exception as exc:
+        raise RuntimeError("google-genai is not installed or could not be imported.") from exc
+
+    client = genai.Client(api_key=CONFIG.gemini_api_key)
+
+    temp_wav_path: Path | None = None
+    uploaded_file = None
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(audio_bytes)
+            f.flush()
+            temp_wav_path = Path(f.name)
+
+        # 1. Primary: Try dedicated speech-to-text model (gemini-3.5-transcribe)
+        try:
+            uploaded_file = client.files.upload(file=str(temp_wav_path))
+            interaction = client.interactions.create(
+                model=GEMINI_TRANSCRIBE_MODEL_ID,
+                input=[
+                    {
+                        "type": "audio",
+                        "uri": uploaded_file.uri,
+                        "mime_type": "audio/wav",
+                    }
+                ],
+            )
+            transcript = getattr(interaction, "output_text", "") or ""
+            if isinstance(transcript, str) and transcript.strip():
+                log(f"[Transcribe] (gemini-3.5-transcribe) Result: {transcript.strip()!r}")
+                return transcript.strip()
+        except Exception as stt_err:
+            log(f"[Transcribe WARN] gemini-3.5-transcribe failed: {stt_err}. Attempting fallback...")
+
+        # 2. Fallback: Multimodal audio transcription using Gemini Flash
+        try:
+            prompt = (
+                "Listen carefully to this audio and transcribe the speaker's words verbatim. "
+                "Output ONLY the transcribed words. Do not add quotes, explanations, or timestamps."
+            )
+            audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
+            response = client.models.generate_content(
+                model=GEMINI_MODEL_ID,
+                contents=[audio_part, prompt],
+            )
+            transcript = extract_gemini_text(response).strip()
+            log(f"[Transcribe] (fallback) Result: {transcript!r}")
+            return transcript
+        except Exception as fallback_err:
+            log(f"[Transcribe ERROR] Fallback transcription failed: {fallback_err}")
+            raise RuntimeError(f"Audio transcription failed: {fallback_err}") from fallback_err
+
+    finally:
+        if temp_wav_path is not None and temp_wav_path.exists():
+            try:
+                temp_wav_path.unlink()
+            except OSError:
+                pass
+        if uploaded_file is not None:
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except Exception:
+                pass
+
+
+# ============================================================
 # FISH AUDIO
 # ============================================================
 
@@ -519,6 +602,32 @@ def process_prompt(prompt: str) -> dict[str, Any]:
         return {
             "ok": True,
             "seq": snapshot["seq"],
+            "text": japanese_reply,
+            "audio_url": snapshot["audio_url"],
+        }
+
+
+def process_voice_prompt(audio_bytes: bytes) -> dict[str, Any]:
+    if not audio_bytes:
+        raise ValueError("Missing audio data.")
+
+    # 1. Transcribe speech using Gemini 3.5 Transcribe
+    transcript = transcribe_audio(audio_bytes)
+    if not transcript:
+        log("[Transcribe WARN] No speech recognized in audio. Using prompt fallback.")
+        transcript = "ハルが何か話しかけたが、声が小さくて聞き取れなかった"
+
+    # 2. Process through existing persona and Fish Audio pipeline
+    with process_lock:
+        japanese_reply = call_gemini(transcript)
+        call_fish_audio(japanese_reply)
+        snapshot = speech_state.queue_new_audio(japanese_reply)
+        log(f"[Server] Voice audio queued seq={snapshot['seq']} for transcript={transcript!r}")
+        return {
+            "ok": True,
+            "seq": snapshot["seq"],
+            "transcript": transcript,
+            "reply": japanese_reply,
             "text": japanese_reply,
             "audio_url": snapshot["audio_url"],
         }
@@ -664,11 +773,72 @@ class RamRequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _read_audio_bytes(self) -> bytes:
+        content_length = int(self.headers.get("Content-Length", "0") or "0")
+        if not content_length:
+            raise ValueError("Audio payload is empty.")
+
+        content_type = self.headers.get("Content-Type", "")
+        raw_body = self.rfile.read(content_length)
+
+        # Handle multipart/form-data if sent via browser or curl -F
+        if "multipart/form-data" in content_type.lower():
+            boundary = ""
+            for param in content_type.split(";"):
+                param = param.strip()
+                if param.lower().startswith("boundary="):
+                    boundary = param.split("=", 1)[1].strip('"\' ')
+            if boundary:
+                boundary_bytes = boundary.encode("latin1")
+                parts = raw_body.split(b"--" + boundary_bytes)
+                for part in parts:
+                    if b"\r\n\r\n" in part:
+                        header_chunk, body_chunk = part.split(b"\r\n\r\n", 1)
+                        header_chunk_lower = header_chunk.lower()
+                        if b"filename=" in header_chunk_lower or b'name="file"' in header_chunk_lower or b'name="audio"' in header_chunk_lower:
+                            if body_chunk.endswith(b"\r\n"):
+                                body_chunk = body_chunk[:-2]
+                            return body_chunk
+
+        # Otherwise treat raw_body directly as audio stream (WAV binary from ESP32)
+        return raw_body
+
+    def _handle_voice_submission(self) -> None:
+        try:
+            audio_bytes = self._read_audio_bytes()
+        except ValueError as exc:
+            write_json(
+                self,
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "ok": False,
+                    "error": str(exc),
+                },
+            )
+            return
+
+        try:
+            result = process_voice_prompt(audio_bytes)
+        except Exception as exc:
+            speech_state.note_error(str(exc))
+            log(f"[ERROR] Voice chat processing failed: {exc}")
+            write_json(
+                self,
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "ok": False,
+                    "error": str(exc),
+                },
+            )
+            return
+
+        write_json(self, HTTPStatus.OK, result)
+
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Chibi-Ram-Token, Authorization")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -703,6 +873,12 @@ class RamRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         route_path = self._route_path()
+
+        if route_path in {"/voice-chat", "/voice"}:
+            if not self._require_chat_token(self._route_query()):
+                return
+            self._handle_voice_submission()
+            return
 
         if route_path not in {"/chat", "/process"}:
             self.send_error(HTTPStatus.NOT_FOUND)
