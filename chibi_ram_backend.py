@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,8 +21,16 @@ ENV_FILE = ROOT_DIR / ".env"
 STATIC_DIR = ROOT_DIR / "static"
 AUDIO_FILE_PATH = STATIC_DIR / "ram_speech.mp3"
 SERVICE_NAME = "chibi-ram-backend"
-GEMINI_MODEL_ID = "gemini-3.6-flash"
-GEMINI_TRANSCRIBE_MODEL_ID = "gemini-3.5-transcribe"
+GEMINI_MODEL_ID = os.environ.get("GEMINI_MODEL_ID", "gemini-3.6-flash").strip() or "gemini-3.6-flash"
+GEMINI_TRANSCRIBE_MODEL_ID = (
+    os.environ.get("GEMINI_TRANSCRIBE_MODEL_ID", "gemini-3.5-transcribe").strip()
+    or "gemini-3.5-transcribe"
+)
+GEMINI_FALLBACK_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]
 DEFAULT_PORT = 8000
 CHAT_TOKEN_HEADER = "X-Chibi-Ram-Token"
 
@@ -414,26 +423,37 @@ def call_gemini(user_prompt: str) -> str:
         raise RuntimeError("google-genai is not installed or could not be imported.") from exc
 
     client = genai.Client(api_key=CONFIG.gemini_api_key)
-    response = client.models.generate_content(
-        model=GEMINI_MODEL_ID,
-        contents=user_prompt,
-        config=build_gemini_config(),
-    )
 
-    if CONFIG.debug:
-        log_gemini_debug(response)
+    models_to_try = [GEMINI_MODEL_ID] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL_ID]
+    last_error: Exception | None = None
 
-    reply = extract_gemini_text(response)
-    if not reply:
-        log("[Gemini WARN] Empty response received. Using fallback text.")
-        reply = "……なに？もう一度言いなさいよ、ハル。"
+    for model_name in models_to_try:
+        try:
+            log(f"[Gemini] Requesting model {model_name}...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=user_prompt,
+                config=build_gemini_config(),
+            )
+            if CONFIG.debug:
+                log_gemini_debug(response)
 
-    log(f"[Gemini] Ram: {reply}")
-    return reply
+            reply = extract_gemini_text(response)
+            if reply:
+                log(f"[Gemini] ({model_name}) Ram: {reply}")
+                return reply
+            log(f"[Gemini WARN] Model {model_name} returned empty text.")
+        except Exception as exc:
+            last_error = exc
+            log(f"[Gemini WARN] Model {model_name} failed: {exc}")
+            time.sleep(0.3)
+
+    log(f"[Gemini ERROR] All models failed ({last_error}). Using fallback text.")
+    return "……なに？少し忙しくて聞こえなかったわ。もう一度言いなさいよ、ハル。"
 
 
 # ============================================================
-# SPEECH-TO-TEXT (Gemini 3.5 Transcribe + Fallback)
+# SPEECH-TO-TEXT (Gemini 3.5 Transcribe + Multi-Model Fallback)
 # ============================================================
 
 
@@ -483,23 +503,40 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         except Exception as stt_err:
             log(f"[Transcribe WARN] gemini-3.5-transcribe failed: {stt_err}. Attempting fallback...")
 
-        # 2. Fallback: Multimodal audio transcription using Gemini Flash
-        try:
-            prompt = (
-                "Listen carefully to this audio and transcribe the speaker's words verbatim. "
-                "Output ONLY the transcribed words. Do not add quotes, explanations, or timestamps."
-            )
-            audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
-            response = client.models.generate_content(
-                model=GEMINI_MODEL_ID,
-                contents=[audio_part, prompt],
-            )
-            transcript = extract_gemini_text(response).strip()
-            log(f"[Transcribe] (fallback) Result: {transcript!r}")
-            return transcript
-        except Exception as fallback_err:
-            log(f"[Transcribe ERROR] Fallback transcription failed: {fallback_err}")
-            raise RuntimeError(f"Audio transcription failed: {fallback_err}") from fallback_err
+        # 2. Fallback: Multimodal audio transcription across fallback models
+        models_to_try = [
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
+            GEMINI_MODEL_ID,
+        ]
+        seen: set[str] = set()
+        stt_fallback_models = [m for m in models_to_try if not (m in seen or seen.add(m))]
+
+        prompt = (
+            "Listen carefully to this audio and transcribe the speaker's words verbatim. "
+            "Output ONLY the transcribed words. Do not add quotes, explanations, or timestamps."
+        )
+        audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
+
+        for model_name in stt_fallback_models:
+            try:
+                log(f"[Transcribe] Trying fallback model {model_name}...")
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[audio_part, prompt],
+                )
+                transcript = extract_gemini_text(response).strip()
+                if transcript:
+                    log(f"[Transcribe] ({model_name} fallback) Result: {transcript!r}")
+                    return transcript
+                log(f"[Transcribe WARN] Model {model_name} returned empty transcript.")
+            except Exception as fb_err:
+                log(f"[Transcribe WARN] Model {model_name} transcription failed: {fb_err}")
+                time.sleep(0.3)
+
+        log("[Transcribe WARN] All transcription attempts failed or timed out.")
+        return ""
 
     finally:
         if temp_wav_path is not None and temp_wav_path.exists():

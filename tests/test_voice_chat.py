@@ -230,6 +230,18 @@ class TranscribeAudioTest(unittest.TestCase):
         mock_client.models.generate_content.assert_called_once()
         mock_client.files.delete.assert_called_once_with(name="files/123")
 
+    @patch("google.genai.Client")
+    def test_transcribe_audio_all_models_fail_returns_empty_string(self, mock_client_cls):
+        mock_client = mock_client_cls.return_value
+        mock_file = unittest.mock.MagicMock(uri="mock://files/123")
+        mock_file.name = "files/123"
+        mock_client.files.upload.return_value = mock_file
+        mock_client.interactions.create.side_effect = Exception("503 unavailable")
+        mock_client.models.generate_content.side_effect = Exception("503 unavailable across all models")
+
+        result = backend.transcribe_audio(b"RIFF_FAKE_AUDIO_DATA")
+        self.assertEqual(result, "")
+
 
 class ProcessVoicePromptTest(unittest.TestCase):
     def setUp(self):
@@ -261,6 +273,17 @@ class ProcessVoicePromptTest(unittest.TestCase):
         mock_transcribe.assert_called_once_with(b"FAKE_WAV_BYTES")
         mock_gemini.assert_called_once_with("おはよう、ラム")
         mock_fish.assert_called_once_with("……うるさいわね、ハル。")
+
+    @patch.object(backend, "transcribe_audio", return_value="")
+    @patch.object(backend, "call_gemini", return_value="何かしらハル、聞こえなかったわ。")
+    @patch.object(backend, "call_fish_audio")
+    def test_process_voice_prompt_empty_transcript_uses_fallback(self, mock_fish, mock_gemini, mock_transcribe):
+        result = backend.process_voice_prompt(b"SILENT_WAV_BYTES")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["transcript"], "ハルが何か話しかけたが、声が小さくて聞き取れなかった")
+        self.assertEqual(result["reply"], "何かしらハル、聞こえなかったわ。")
+        mock_gemini.assert_called_once_with("ハルが何か話しかけたが、声が小さくて聞き取れなかった")
 
 
 if __name__ == "__main__":
