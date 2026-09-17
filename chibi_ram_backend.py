@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import struct
 import sys
 import tempfile
 import threading
 import time
+import wave
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -486,6 +489,50 @@ def call_gemini(user_prompt: str) -> str:
 # ============================================================
 
 
+def normalize_and_convert_mono(wav_bytes: bytes, target_peak: int = 26000) -> bytes:
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            n_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            n_frames = wf.getnframes()
+            raw_frames = wf.readframes(n_frames)
+
+        if sampwidth != 2 or n_frames == 0:
+            return wav_bytes
+
+        total_samples = len(raw_frames) // 2
+        samples = struct.unpack(f"<{total_samples}h", raw_frames)
+
+        if n_channels == 2:
+            mono_samples = [(samples[i] + samples[i + 1]) // 2 for i in range(0, total_samples, 2)]
+        else:
+            mono_samples = list(samples)
+
+        current_peak = max((abs(s) for s in mono_samples), default=0)
+        log(f"[Audio] Input frames: {n_frames}, channels: {n_channels}, peak: {current_peak}")
+
+        if current_peak > 50:
+            gain = min(target_peak / current_peak, 10.0)
+            boosted = [max(-32768, min(32767, int(s * gain))) for s in mono_samples]
+            new_peak = max((abs(s) for s in boosted), default=0)
+            log(f"[Audio] Applied software auto-gain {gain:.2f}x -> new peak {new_peak}")
+        else:
+            boosted = mono_samples
+
+        out_buf = io.BytesIO()
+        with wave.open(out_buf, "wb") as out_wf:
+            out_wf.setnchannels(1)
+            out_wf.setsampwidth(2)
+            out_wf.setframerate(framerate)
+            out_wf.writeframes(struct.pack(f"<{len(boosted)}h", *boosted))
+
+        return out_buf.getvalue()
+    except Exception as exc:
+        log(f"[Audio WARN] Normalization failed ({exc}), using raw audio.")
+        return wav_bytes
+
+
 def transcribe_audio(audio_bytes: bytes) -> str:
     if not CONFIG.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured.")
@@ -494,6 +541,7 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         raise ValueError("Audio data is empty.")
 
     log(f"[Transcribe] Processing {len(audio_bytes)} bytes of audio...")
+    processed_audio = normalize_and_convert_mono(audio_bytes)
 
     try:
         from google import genai
@@ -508,7 +556,7 @@ def transcribe_audio(audio_bytes: bytes) -> str:
 
     try:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(audio_bytes)
+            f.write(processed_audio)
             f.flush()
             temp_wav_path = Path(f.name)
 
@@ -546,7 +594,7 @@ def transcribe_audio(audio_bytes: bytes) -> str:
             "Transcribe the speaker's words in this audio verbatim in their original language (Japanese or English). "
             "Output ONLY the transcribed words. Do not add quotes, markdown, explanations, or timestamps."
         )
-        audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
+        audio_part = types.Part.from_bytes(data=processed_audio, mime_type="audio/wav")
 
         for model_name in stt_fallback_models:
             try:
