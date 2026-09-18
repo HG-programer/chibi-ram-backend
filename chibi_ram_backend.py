@@ -24,15 +24,15 @@ ENV_FILE = ROOT_DIR / ".env"
 STATIC_DIR = ROOT_DIR / "static"
 AUDIO_FILE_PATH = STATIC_DIR / "ram_speech.mp3"
 SERVICE_NAME = "chibi-ram-backend"
-GEMINI_MODEL_ID = os.environ.get("GEMINI_MODEL_ID", "gemini-3.6-flash").strip() or "gemini-3.6-flash"
+GEMINI_MODEL_ID = os.environ.get("GEMINI_MODEL_ID", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
 GEMINI_TRANSCRIBE_MODEL_ID = (
     os.environ.get("GEMINI_TRANSCRIBE_MODEL_ID", "gemini-3.5-transcribe").strip()
     or "gemini-3.5-transcribe"
 )
 GEMINI_FALLBACK_MODELS = [
-    "gemini-2.5-flash",
     "gemini-2.0-flash",
     "gemini-1.5-flash",
+    "gemini-3.6-flash",
 ]
 DEFAULT_PORT = 8000
 CHAT_TOKEN_HEADER = "X-Chibi-Ram-Token"
@@ -207,16 +207,25 @@ class SpeechState:
         self.has_new_audio = False
         self.last_japanese_text = ""
         self.last_error = ""
+        self.last_gemini_error = ""
+        self.last_stt_error = ""
         self.lock = threading.Lock()
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
-            return {
+            data = {
                 "has_new_audio": self.has_new_audio,
                 "seq": self.seq,
                 "text": self.last_japanese_text,
                 "audio_url": f"/ram_speech.mp3?seq={self.seq}",
             }
+            if self.last_gemini_error:
+                data["last_gemini_error"] = self.last_gemini_error
+            if self.last_stt_error:
+                data["last_stt_error"] = self.last_stt_error
+            if self.last_error:
+                data["last_error"] = self.last_error
+            return data
 
     def queue_new_audio(self, japanese_text: str) -> dict[str, Any]:
         with self.lock:
@@ -343,25 +352,11 @@ def build_gemini_config(model_name: str = ""):
         "max_output_tokens": 400,
     }
 
-    thinking_config_cls = getattr(types, "ThinkingConfig", None)
-    if thinking_config_cls is not None:
-        try:
-            if "gemini-3" in model_name.lower():
-                config_kwargs["thinking_config"] = thinking_config_cls(thinking_level="minimal")
-            else:
-                config_kwargs["thinking_config"] = thinking_config_cls(thinking_budget=0)
-        except Exception:
-            pass
-
     generate_config_cls = getattr(types, "GenerateContentConfig", None)
     if generate_config_cls is None:
         raise RuntimeError("google-genai is missing GenerateContentConfig.")
 
-    try:
-        return generate_config_cls(**config_kwargs)
-    except Exception:
-        config_kwargs.pop("thinking_config", None)
-        return generate_config_cls(**config_kwargs)
+    return generate_config_cls(**config_kwargs)
 
 
 def extract_interaction_text(interaction: Any) -> str:
@@ -473,6 +468,7 @@ def call_gemini(user_prompt: str) -> str:
             reply = extract_gemini_text(response)
             if reply:
                 log(f"[Gemini] ({model_name}) Ram: {reply}")
+                speech_state.last_gemini_error = ""
                 return reply
             log(f"[Gemini WARN] Model {model_name} returned empty text.")
         except Exception as exc:
@@ -480,6 +476,7 @@ def call_gemini(user_prompt: str) -> str:
             log(f"[Gemini WARN] Model {model_name} failed: {exc}")
             time.sleep(0.3)
 
+    speech_state.last_gemini_error = str(last_error) if last_error else "All models returned empty"
     log(f"[Gemini ERROR] All models failed ({last_error}). Using fallback text.")
     return "……なに？少し忙しくて聞こえなかったわ。もう一度言いなさいよ、ハル。"
 
@@ -505,7 +502,12 @@ def normalize_and_convert_mono(wav_bytes: bytes, target_peak: int = 26000) -> by
         samples = struct.unpack(f"<{total_samples}h", raw_frames)
 
         if n_channels == 2:
-            mono_samples = [(samples[i] + samples[i + 1]) // 2 for i in range(0, total_samples, 2)]
+            ch0_samples = [samples[i] for i in range(0, total_samples, 2)]
+            ch1_samples = [samples[i + 1] for i in range(0, total_samples, 2)]
+            peak0 = max((abs(s) for s in ch0_samples), default=0)
+            peak1 = max((abs(s) for s in ch1_samples), default=0)
+            mono_samples = ch0_samples if peak0 >= peak1 else ch1_samples
+            log(f"[Audio] Selected stronger channel (L:{peak0} R:{peak1}) to prevent phase cancellation")
         else:
             mono_samples = list(samples)
 
@@ -576,6 +578,7 @@ def transcribe_audio(audio_bytes: bytes) -> str:
             transcript = extract_interaction_text(interaction)
             if transcript:
                 log(f"[Transcribe] (gemini-3.5-transcribe) Result: {transcript!r}")
+                speech_state.last_stt_error = ""
                 return transcript
         except Exception as stt_err:
             log(f"[Transcribe WARN] gemini-3.5-transcribe failed: {stt_err}. Attempting fallback...")
@@ -596,22 +599,27 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         )
         audio_part = types.Part.from_bytes(data=processed_audio, mime_type="audio/wav")
 
+        last_stt_err: Exception | None = None
         for model_name in stt_fallback_models:
             try:
                 log(f"[Transcribe] Trying fallback model {model_name}...")
+                audio_content = uploaded_file if uploaded_file is not None else audio_part
                 response = client.models.generate_content(
                     model=model_name,
-                    contents=[audio_part, prompt],
+                    contents=[audio_content, prompt],
                 )
                 transcript = extract_gemini_text(response).strip()
                 if transcript:
                     log(f"[Transcribe] ({model_name} fallback) Result: {transcript!r}")
+                    speech_state.last_stt_error = ""
                     return transcript
                 log(f"[Transcribe WARN] Model {model_name} returned empty transcript.")
             except Exception as fb_err:
+                last_stt_err = fb_err
                 log(f"[Transcribe WARN] Model {model_name} transcription failed: {fb_err}")
                 time.sleep(0.3)
 
+        speech_state.last_stt_error = str(last_stt_err) if last_stt_err else "All models returned empty transcript"
         log("[Transcribe WARN] All transcription attempts failed or timed out.")
         return ""
 
