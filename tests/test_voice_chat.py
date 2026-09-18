@@ -201,42 +201,30 @@ class TranscribeAudioTest(unittest.TestCase):
     @patch("google.genai.Client")
     def test_transcribe_audio_primary_success(self, mock_client_cls):
         mock_client = mock_client_cls.return_value
-        mock_file = unittest.mock.MagicMock(uri="mock://files/123")
-        mock_file.name = "files/123"
-        mock_client.files.upload.return_value = mock_file
-        mock_client.interactions.create.return_value = unittest.mock.MagicMock(
-            output_text="Hello Ram, how are you?",
-        )
-
-        result = backend.transcribe_audio(b"RIFF_FAKE_AUDIO_DATA")
-        self.assertEqual(result, "Hello Ram, how are you?")
-        mock_client.interactions.create.assert_called_once()
-        mock_client.files.delete.assert_called_once_with(name="files/123")
-
-    @patch("google.genai.Client")
-    def test_transcribe_audio_fallback_when_transcribe_fails(self, mock_client_cls):
-        mock_client = mock_client_cls.return_value
-        mock_file = unittest.mock.MagicMock(uri="mock://files/123")
-        mock_file.name = "files/123"
-        mock_client.files.upload.return_value = mock_file
-        mock_client.interactions.create.side_effect = Exception("gemini-3.5-transcribe unavailable")
         mock_client.models.generate_content.return_value = unittest.mock.MagicMock(
-            text="Fallback transcribed text",
+            text="Hello Ram, how are you?",
             candidates=[],
         )
 
         result = backend.transcribe_audio(b"RIFF_FAKE_AUDIO_DATA")
-        self.assertEqual(result, "Fallback transcribed text")
+        self.assertEqual(result, "Hello Ram, how are you?")
         mock_client.models.generate_content.assert_called_once()
-        mock_client.files.delete.assert_called_once_with(name="files/123")
+
+    @patch("google.genai.Client")
+    def test_transcribe_audio_fallback_when_first_model_fails(self, mock_client_cls):
+        mock_client = mock_client_cls.return_value
+        mock_client.models.generate_content.side_effect = [
+            Exception("model overloaded"),
+            unittest.mock.MagicMock(text="Fallback transcribed text", candidates=[]),
+        ]
+
+        result = backend.transcribe_audio(b"RIFF_FAKE_AUDIO_DATA")
+        self.assertEqual(result, "Fallback transcribed text")
+        self.assertEqual(mock_client.models.generate_content.call_count, 2)
 
     @patch("google.genai.Client")
     def test_transcribe_audio_all_models_fail_returns_empty_string(self, mock_client_cls):
         mock_client = mock_client_cls.return_value
-        mock_file = unittest.mock.MagicMock(uri="mock://files/123")
-        mock_file.name = "files/123"
-        mock_client.files.upload.return_value = mock_file
-        mock_client.interactions.create.side_effect = Exception("503 unavailable")
         mock_client.models.generate_content.side_effect = Exception("503 unavailable across all models")
 
         result = backend.transcribe_audio(b"RIFF_FAKE_AUDIO_DATA")

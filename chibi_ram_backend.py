@@ -563,90 +563,44 @@ def transcribe_audio(audio_bytes: bytes) -> str:
 
     client = genai.Client(api_key=CONFIG.gemini_api_key)
 
-    temp_wav_path: Path | None = None
-    uploaded_file = None
+    prompt = (
+        "Transcribe the speaker's words in this audio verbatim in their original language (Japanese or English). "
+        "Output ONLY the transcribed words. Do not add quotes, markdown, explanations, or timestamps."
+    )
+    audio_part = types.Part.from_bytes(data=processed_audio, mime_type="audio/wav")
 
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(processed_audio)
-            f.flush()
-            temp_wav_path = Path(f.name)
+    models_to_try = [
+        "gemini-flash-latest",
+        "gemini-3.5-flash",
+        "gemini-flash-lite-latest",
+        "gemini-2.5-flash-lite",
+    ]
+    if GEMINI_MODEL_ID not in models_to_try:
+        models_to_try.append(GEMINI_MODEL_ID)
 
-        # 1. Primary: Try dedicated speech-to-text model (gemini-3.5-transcribe)
+    stt_errors: list[str] = []
+    for model_name in models_to_try:
         try:
-            uploaded_file = client.files.upload(file=str(temp_wav_path))
-            interaction = client.interactions.create(
-                model=GEMINI_TRANSCRIBE_MODEL_ID,
-                input=[
-                    {
-                        "type": "audio",
-                        "uri": uploaded_file.uri,
-                        "mime_type": "audio/wav",
-                    }
-                ],
+            log(f"[Transcribe] Requesting model {model_name}...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[audio_part, prompt],
             )
-            transcript = extract_interaction_text(interaction)
+            transcript = extract_gemini_text(response).strip()
             if transcript:
-                log(f"[Transcribe] (gemini-3.5-transcribe) Result: {transcript!r}")
+                log(f"[Transcribe] ({model_name}) Result: {transcript!r}")
                 speech_state.last_stt_error = ""
                 return transcript
-        except Exception as stt_err:
-            log(f"[Transcribe WARN] gemini-3.5-transcribe failed: {stt_err}. Attempting fallback...")
+            log(f"[Transcribe WARN] Model {model_name} returned empty transcript.")
+            stt_errors.append(f"{model_name}: empty")
+        except Exception as fb_err:
+            stt_errors.append(f"{model_name}: {fb_err}")
+            log(f"[Transcribe WARN] Model {model_name} transcription failed: {fb_err}")
+            time.sleep(0.3)
 
-        # 2. Fallback: Multimodal audio transcription across fallback models
-        models_to_try = [
-            GEMINI_TRANSCRIBE_MODEL_ID,
-            "gemini-flash-latest",
-            "gemini-3.5-flash",
-            "gemini-flash-lite-latest",
-            "gemini-2.5-flash-lite",
-            GEMINI_MODEL_ID,
-        ]
-        seen: set[str] = set()
-        stt_fallback_models = [m for m in models_to_try if not (m in seen or seen.add(m))]
-
-        prompt = (
-            "Transcribe the speaker's words in this audio verbatim in their original language (Japanese or English). "
-            "Output ONLY the transcribed words. Do not add quotes, markdown, explanations, or timestamps."
-        )
-        audio_part = types.Part.from_bytes(data=processed_audio, mime_type="audio/wav")
-
-        stt_errors: list[str] = []
-        for model_name in stt_fallback_models:
-            try:
-                log(f"[Transcribe] Trying fallback model {model_name}...")
-                audio_content = uploaded_file if uploaded_file is not None else audio_part
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=[audio_content, prompt],
-                )
-                transcript = extract_gemini_text(response).strip()
-                if transcript:
-                    log(f"[Transcribe] ({model_name} fallback) Result: {transcript!r}")
-                    speech_state.last_stt_error = ""
-                    return transcript
-                log(f"[Transcribe WARN] Model {model_name} returned empty transcript.")
-                stt_errors.append(f"{model_name}: empty")
-            except Exception as fb_err:
-                stt_errors.append(f"{model_name}: {fb_err}")
-                log(f"[Transcribe WARN] Model {model_name} transcription failed: {fb_err}")
-                time.sleep(0.3)
-
-        speech_state.last_stt_error = " || ".join(stt_errors) if stt_errors else "All models returned empty transcript"
-        log("[Transcribe WARN] All transcription attempts failed or timed out.")
-        return ""
-
-    finally:
-        if temp_wav_path is not None and temp_wav_path.exists():
-            try:
-                temp_wav_path.unlink()
-            except OSError:
-                pass
-        if uploaded_file is not None:
-            try:
-                client.files.delete(name=uploaded_file.name)
-            except Exception:
-                pass
+    speech_state.last_stt_error = " || ".join(stt_errors) if stt_errors else "All models returned empty transcript"
+    log(f"[Transcribe WARN] All transcription attempts failed: {speech_state.last_stt_error}")
+    return ""
 
 
 # ============================================================
