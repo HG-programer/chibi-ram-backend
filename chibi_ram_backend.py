@@ -182,7 +182,7 @@ Address the user as Haru (ハル).
 
 Responses should sound natural when spoken aloud.
 Use concise, sharp Japanese suitable for real-time TTS.
-Keep responses short and snappy (strictly 1 to 2 brief sentences, under 50 Japanese characters total).
+Keep responses short and snappy (strictly 1 concise sentence, under 30 Japanese characters total).
 Ram speaks directly, dryly, and without wasting words.
 Always respond in Japanese unless the backend is explicitly configured otherwise.
 Do not explain that you are an AI unless directly asked.
@@ -357,7 +357,7 @@ def build_gemini_config(model_name: str = ""):
     config_kwargs = {
         "system_instruction": RAM_SYSTEM_INSTRUCTION,
         "temperature": 0.75,
-        "max_output_tokens": 150,
+        "max_output_tokens": 60,
     }
 
     generate_config_cls = getattr(types, "GenerateContentConfig", None)
@@ -571,10 +571,10 @@ def transcribe_audio(audio_bytes: bytes) -> str:
     audio_part = types.Part.from_bytes(data=processed_audio, mime_type="audio/wav")
 
     models_to_try = [
-        "gemini-flash-latest",
-        "gemini-3.5-flash",
         "gemini-flash-lite-latest",
         "gemini-2.5-flash-lite",
+        "gemini-flash-latest",
+        "gemini-3.5-flash",
     ]
     if GEMINI_MODEL_ID not in models_to_try:
         models_to_try.append(GEMINI_MODEL_ID)
@@ -662,6 +662,7 @@ def call_fish_audio(japanese_text: str) -> None:
         "text": japanese_text,
         "reference_id": CONFIG.fish_audio_ram_model_id,
         "format": "mp3",
+        "latency": "balanced",
     }
 
     with httpx.Client(timeout=30.0) as client:
