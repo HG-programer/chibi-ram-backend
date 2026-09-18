@@ -178,7 +178,7 @@ Personality:
 - occasionally teases or criticizes Haru
 - polite when appropriate
 
-Address the user as Haru (ハル).
+Address the user as Haru (ハル). Usually start your reply by addressing Haru up-front (for example: 「ハル、聞こえているわ。」 or 「ハル、暑さに負けて手を止める気かしら。」).
 
 Responses should sound natural when spoken aloud.
 Use concise, sharp Japanese suitable for real-time TTS.
@@ -653,6 +653,11 @@ def call_fish_audio(japanese_text: str) -> None:
     except Exception as exc:
         raise RuntimeError("httpx is not installed or could not be imported.") from exc
 
+    clean_text = japanese_text.strip()
+    if not clean_text.endswith(("。", "！", "？", "…", "・")):
+        clean_text += "。"
+    clean_text += " "
+
     url = "https://api.fish.audio/v1/tts"
     headers = {
         "Authorization": f"Bearer {CONFIG.fish_audio_api_key}",
@@ -660,7 +665,7 @@ def call_fish_audio(japanese_text: str) -> None:
         "model": "s2.1-pro-free",
     }
     payload = {
-        "text": japanese_text,
+        "text": clean_text,
         "reference_id": CONFIG.fish_audio_ram_model_id,
         "format": "mp3",
         "latency": "balanced",
