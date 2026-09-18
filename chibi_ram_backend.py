@@ -1115,10 +1115,32 @@ class RamRequestHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Chibi-Ram-Token, Authorization")
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def do_HEAD(self) -> None:
+        route_path = self._route_path()
+        if route_path == "/ram_speech.mp3":
+            if not AUDIO_FILE_PATH.exists():
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            audio_bytes = AUDIO_FILE_PATH.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Content-Length", str(len(audio_bytes)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            return
+        if route_path in {"/health", "/status", "/ack"}:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_GET(self) -> None:
         route_path = self._route_path()
