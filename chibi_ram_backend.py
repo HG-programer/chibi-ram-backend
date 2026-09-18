@@ -724,6 +724,106 @@ def process_voice_prompt(audio_bytes: bytes) -> dict[str, Any]:
         }
 
 
+def process_vision_prompt(
+    image_bytes: bytes,
+    audio_bytes: bytes | None = None,
+    text_prompt: str | None = None,
+) -> dict[str, Any]:
+    if not image_bytes:
+        raise ValueError("Missing camera image data.")
+
+    log(f"[Vision] Processing image ({len(image_bytes)} bytes)...")
+
+    # 1. Transcribe speech if voice audio was provided
+    transcript = ""
+    if audio_bytes and len(audio_bytes) > 200:
+        try:
+            transcript = transcribe_audio(audio_bytes)
+        except Exception as exc:
+            log(f"[Vision WARN] Audio transcription failed: {exc}")
+
+    if not transcript:
+        if text_prompt and text_prompt.strip():
+            transcript = text_prompt.strip()
+        else:
+            transcript = "（ハルが無言でラムのカメラの前に立っている、または何かを見せている）"
+
+    # 2. Call Gemini Vision
+    try:
+        from google import genai
+        from google.genai import types
+    except Exception as exc:
+        raise RuntimeError("google-genai is not installed or could not be imported.") from exc
+
+    client = genai.Client(api_key=CONFIG.gemini_api_key)
+    image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+
+    vision_system_instruction = (
+        "You are Ram (ラム), the pink-haired twin maid from Re:Zero. "
+        "You are observing Haru (ハル) through your desktop robot's OV3660 camera. "
+        f"Context / Speech from Haru: {transcript!r}. "
+        "Carefully observe Haru's facial expression, posture, clothing, objects held, or desk workspace in the image. "
+        "React and respond in your signature Ram persona: calm, sharp-tongued, sarcastic, confident, observant. "
+        "Keep your spoken response concise, sharp, and punchy (strictly 1 to 2 brief sentences, under 50 Japanese characters total). "
+        "Always respond in Japanese suitable for TTS."
+    )
+
+    models_to_try = [
+        "gemini-flash-latest",
+        "gemini-3.5-flash",
+        "gemini-flash-lite-latest",
+        "gemini-2.5-flash-lite",
+    ]
+    if GEMINI_MODEL_ID not in models_to_try:
+        models_to_try.insert(0, GEMINI_MODEL_ID)
+
+    generate_config_cls = getattr(types, "GenerateContentConfig", None)
+    config = (
+        generate_config_cls(
+            system_instruction=vision_system_instruction,
+            temperature=0.75,
+            max_output_tokens=150,
+        )
+        if generate_config_cls
+        else None
+    )
+
+    japanese_reply = ""
+    for model_name in models_to_try:
+        try:
+            log(f"[Vision] Requesting model {model_name}...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[image_part, "ハルの姿や周囲を観察して、ラムらしく簡潔に一言コメントしなさい。"],
+                config=config,
+            )
+            japanese_reply = extract_gemini_text(response).strip()
+            if japanese_reply:
+                log(f"[Vision] ({model_name}) Ram: {japanese_reply}")
+                speech_state.last_gemini_error = ""
+                break
+        except Exception as exc:
+            log(f"[Vision WARN] Model {model_name} vision failed: {exc}")
+            time.sleep(0.3)
+
+    if not japanese_reply:
+        japanese_reply = "ラムの目を節穴だと思っているのかしら、ハル。何もかも丸見えよ。"
+
+    # 3. Synthesize speech via Fish Audio
+    with process_lock:
+        call_fish_audio(japanese_reply)
+        snapshot = speech_state.queue_new_audio(japanese_reply)
+        log(f"[Server] Vision audio queued seq={snapshot['seq']}")
+        return {
+            "ok": True,
+            "seq": snapshot["seq"],
+            "transcript": transcript,
+            "reply": japanese_reply,
+            "text": japanese_reply,
+            "audio_url": snapshot["audio_url"],
+        }
+
+
 # ============================================================
 # HTTP SERVER
 # ============================================================
@@ -934,6 +1034,82 @@ class RamRequestHandler(BaseHTTPRequestHandler):
 
         write_json(self, HTTPStatus.OK, result)
 
+    def _handle_vision_submission(self) -> None:
+        content_length = int(self.headers.get("Content-Length", "0") or "0")
+        if not content_length:
+            write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Empty payload."})
+            return
+
+        content_type = self.headers.get("Content-Type", "")
+        raw_body = self.rfile.read(content_length)
+
+        image_bytes: bytes = b""
+        audio_bytes: bytes | None = None
+        text_prompt: str | None = None
+
+        if "multipart/form-data" in content_type.lower():
+            boundary = ""
+            for param in content_type.split(";"):
+                param = param.strip()
+                if param.lower().startswith("boundary="):
+                    boundary = param.split("=", 1)[1].strip('"\' ')
+            if boundary:
+                boundary_bytes = boundary.encode("latin1")
+                parts = raw_body.split(b"--" + boundary_bytes)
+                for part in parts:
+                    if b"\r\n\r\n" not in part:
+                        continue
+                    header_chunk, body_chunk = part.split(b"\r\n\r\n", 1)
+                    if body_chunk.endswith(b"\r\n"):
+                        body_chunk = body_chunk[:-2]
+                    header_chunk_lower = header_chunk.lower()
+
+                    if b'name="image"' in header_chunk_lower or (b"filename=" in header_chunk_lower and (b".jpg" in header_chunk_lower or b".jpeg" in header_chunk_lower or b".png" in header_chunk_lower)):
+                        image_bytes = body_chunk
+                    elif b'name="audio"' in header_chunk_lower or (b"filename=" in header_chunk_lower and b".wav" in header_chunk_lower):
+                        audio_bytes = body_chunk
+                    elif b'name="message"' in header_chunk_lower or b'name="prompt"' in header_chunk_lower:
+                        try:
+                            text_prompt = body_chunk.decode("utf-8", errors="ignore").strip()
+                        except Exception:
+                            pass
+        elif "application/json" in content_type.lower():
+            import base64
+            try:
+                payload = json.loads(raw_body.decode("utf-8"))
+                img_b64 = payload.get("image") or payload.get("image_base64", "")
+                if img_b64:
+                    image_bytes = base64.b64decode(img_b64)
+                aud_b64 = payload.get("audio") or payload.get("audio_base64", "")
+                if aud_b64:
+                    audio_bytes = base64.b64decode(aud_b64)
+                text_prompt = payload.get("message") or payload.get("prompt", "")
+            except Exception as exc:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"JSON parse error: {exc}"})
+                return
+        else:
+            # Raw image binary
+            image_bytes = raw_body
+            text_prompt = self.headers.get("X-Prompt", "").strip() or None
+
+        if not text_prompt:
+            query = self._route_query()
+            text_prompt = query.get("q", [""])[0].strip() or None
+
+        if not image_bytes:
+            write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "No image data found."})
+            return
+
+        try:
+            result = process_vision_prompt(image_bytes, audio_bytes=audio_bytes, text_prompt=text_prompt)
+        except Exception as exc:
+            speech_state.note_error(str(exc))
+            log(f"[ERROR] Vision processing failed: {exc}")
+            write_json(self, HTTPStatus.BAD_GATEWAY, {"ok": False, "error": str(exc)})
+            return
+
+        write_json(self, HTTPStatus.OK, result)
+
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -984,6 +1160,12 @@ class RamRequestHandler(BaseHTTPRequestHandler):
             if not self._require_chat_token(self._route_query()):
                 return
             self._handle_voice_submission()
+            return
+
+        if route_path in {"/vision-chat", "/vision", "/snap-roast"}:
+            if not self._require_chat_token(self._route_query()):
+                return
+            self._handle_vision_submission()
             return
 
         if route_path not in {"/chat", "/process"}:
