@@ -30,9 +30,10 @@ GEMINI_TRANSCRIBE_MODEL_ID = (
     or "gemini-3.5-transcribe"
 )
 GEMINI_FALLBACK_MODELS = [
+    "gemini-2.5-flash",
     "gemini-2.0-flash",
     "gemini-1.5-flash",
-    "gemini-3.6-flash",
+    "gemini-1.5-pro",
 ]
 DEFAULT_PORT = 8000
 CHAT_TOKEN_HEADER = "X-Chibi-Ram-Token"
@@ -453,6 +454,7 @@ def call_gemini(user_prompt: str) -> str:
 
     models_to_try = [GEMINI_MODEL_ID] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL_ID]
     last_error: Exception | None = None
+    model_errors: list[str] = []
 
     for model_name in models_to_try:
         try:
@@ -471,13 +473,15 @@ def call_gemini(user_prompt: str) -> str:
                 speech_state.last_gemini_error = ""
                 return reply
             log(f"[Gemini WARN] Model {model_name} returned empty text.")
+            model_errors.append(f"{model_name}: empty")
         except Exception as exc:
             last_error = exc
+            model_errors.append(f"{model_name}: {exc}")
             log(f"[Gemini WARN] Model {model_name} failed: {exc}")
             time.sleep(0.3)
 
-    speech_state.last_gemini_error = str(last_error) if last_error else "All models returned empty"
-    log(f"[Gemini ERROR] All models failed ({last_error}). Using fallback text.")
+    speech_state.last_gemini_error = " || ".join(model_errors) if model_errors else "All models returned empty"
+    log(f"[Gemini ERROR] All models failed ({speech_state.last_gemini_error}). Using fallback text.")
     return "……なに？少し忙しくて聞こえなかったわ。もう一度言いなさいよ、ハル。"
 
 
@@ -599,7 +603,7 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         )
         audio_part = types.Part.from_bytes(data=processed_audio, mime_type="audio/wav")
 
-        last_stt_err: Exception | None = None
+        stt_errors: list[str] = []
         for model_name in stt_fallback_models:
             try:
                 log(f"[Transcribe] Trying fallback model {model_name}...")
@@ -614,12 +618,13 @@ def transcribe_audio(audio_bytes: bytes) -> str:
                     speech_state.last_stt_error = ""
                     return transcript
                 log(f"[Transcribe WARN] Model {model_name} returned empty transcript.")
+                stt_errors.append(f"{model_name}: empty")
             except Exception as fb_err:
-                last_stt_err = fb_err
+                stt_errors.append(f"{model_name}: {fb_err}")
                 log(f"[Transcribe WARN] Model {model_name} transcription failed: {fb_err}")
                 time.sleep(0.3)
 
-        speech_state.last_stt_error = str(last_stt_err) if last_stt_err else "All models returned empty transcript"
+        speech_state.last_stt_error = " || ".join(stt_errors) if stt_errors else "All models returned empty transcript"
         log("[Transcribe WARN] All transcription attempts failed or timed out.")
         return ""
 
@@ -785,6 +790,15 @@ class RamRequestHandler(BaseHTTPRequestHandler):
     def _send_ack(self) -> None:
         speech_state.acknowledge()
         write_json(self, HTTPStatus.OK, {"status": "ok"})
+
+    def _send_models(self) -> None:
+        try:
+            from google import genai
+            client = genai.Client(api_key=CONFIG.gemini_api_key)
+            models = [getattr(m, "name", str(m)) for m in client.models.list()]
+            write_json(self, HTTPStatus.OK, {"ok": True, "models": models})
+        except Exception as exc:
+            write_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
 
     def _require_chat_token(self, query: dict[str, list[str]] | None = None) -> bool:
         if not CONFIG.chat_api_token:
@@ -977,6 +991,12 @@ class RamRequestHandler(BaseHTTPRequestHandler):
 
         if route_path == "/ack":
             self._send_ack()
+            return
+
+        if route_path == "/models":
+            if not self._require_chat_token(self._route_query()):
+                return
+            self._send_models()
             return
 
         if route_path == "/ram_speech.mp3":
