@@ -24,16 +24,22 @@ ENV_FILE = ROOT_DIR / ".env"
 STATIC_DIR = ROOT_DIR / "static"
 AUDIO_FILE_PATH = STATIC_DIR / "ram_speech.mp3"
 SERVICE_NAME = "chibi-ram-backend"
-GEMINI_MODEL_ID = os.environ.get("GEMINI_MODEL_ID", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+GEMINI_MODEL_ID = (
+    os.environ.get("GEMINI_MODEL_ID", "gemini-flash-latest").strip()
+    or "gemini-flash-latest"
+)
 GEMINI_TRANSCRIBE_MODEL_ID = (
     os.environ.get("GEMINI_TRANSCRIBE_MODEL_ID", "gemini-3.5-transcribe").strip()
     or "gemini-3.5-transcribe"
 )
 GEMINI_FALLBACK_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
+    "gemini-flash-latest",
+    "gemini-3.5-flash",
+    "gemini-flash-lite-latest",
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
 ]
 DEFAULT_PORT = 8000
 CHAT_TOKEN_HEADER = "X-Chibi-Ram-Token"
@@ -589,9 +595,11 @@ def transcribe_audio(audio_bytes: bytes) -> str:
 
         # 2. Fallback: Multimodal audio transcription across fallback models
         models_to_try = [
-            "gemini-2.5-flash",
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
+            GEMINI_TRANSCRIBE_MODEL_ID,
+            "gemini-flash-latest",
+            "gemini-3.5-flash",
+            "gemini-flash-lite-latest",
+            "gemini-2.5-flash-lite",
             GEMINI_MODEL_ID,
         ]
         seen: set[str] = set()
