@@ -591,8 +591,9 @@ def transcribe_audio(audio_bytes: bytes) -> str:
                 log(f"[Transcribe] ({model_name}) Result: {transcript!r}")
                 speech_state.last_stt_error = ""
                 return transcript
-            log(f"[Transcribe WARN] Model {model_name} returned empty transcript.")
-            stt_errors.append(f"{model_name}: empty")
+            log(f"[Transcribe] Model {model_name} evaluated audio: no speech detected.")
+            speech_state.last_stt_error = ""
+            return ""
         except Exception as fb_err:
             stt_errors.append(f"{model_name}: {fb_err}")
             log(f"[Transcribe WARN] Model {model_name} transcription failed: {fb_err}")
