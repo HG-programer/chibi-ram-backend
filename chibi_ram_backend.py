@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -214,6 +215,7 @@ class SpeechState:
         self.seq = 0
         self.has_new_audio = False
         self.last_japanese_text = ""
+        self.last_motion = "IDLE"
         self.last_error = ""
         self.last_gemini_error = ""
         self.last_stt_error = ""
@@ -225,6 +227,7 @@ class SpeechState:
                 "has_new_audio": self.has_new_audio,
                 "seq": self.seq,
                 "text": self.last_japanese_text,
+                "motion": self.last_motion,
                 "audio_url": f"/ram_speech.mp3?seq={self.seq}",
             }
             if self.last_gemini_error:
@@ -235,16 +238,18 @@ class SpeechState:
                 data["last_error"] = self.last_error
             return data
 
-    def queue_new_audio(self, japanese_text: str) -> dict[str, Any]:
+    def queue_new_audio(self, japanese_text: str, motion: str = "IDLE") -> dict[str, Any]:
         with self.lock:
             self.seq += 1
             self.has_new_audio = True
             self.last_japanese_text = japanese_text
+            self.last_motion = motion
             self.last_error = ""
             return {
                 "has_new_audio": self.has_new_audio,
                 "seq": self.seq,
                 "text": self.last_japanese_text,
+                "motion": self.last_motion,
                 "audio_url": f"/ram_speech.mp3?seq={self.seq}",
             }
 
@@ -356,9 +361,13 @@ UNIFIED_AUDIO_PERSONA_SCHEMA = {
     "type": "OBJECT",
     "properties": {
         "transcript": {"type": "STRING"},
+        "motion": {
+            "type": "STRING",
+            "enum": ["TILT", "NOD", "SHAKE", "WAVE", "IDLE"],
+        },
         "reply": {"type": "STRING"},
     },
-    "required": ["transcript", "reply"],
+    "required": ["transcript", "motion", "reply"],
 }
 
 
@@ -716,18 +725,30 @@ def process_prompt(prompt: str) -> dict[str, Any]:
 
     with process_lock:
         japanese_reply = call_gemini(prompt)
-        call_fish_audio(japanese_reply)
-        snapshot = speech_state.queue_new_audio(japanese_reply)
-        log(f"[Server] Audio queued seq={snapshot['seq']}")
+        motion = "NOD"
+        lower = prompt.lower()
+        if any(w in lower or w in prompt for w in ["こんにちは", "hello", "hi", "おはよう", "wave"]):
+            motion = "WAVE"
+        elif any(w in lower or w in prompt for w in ["どう", "なんで", "why", "what", "？", "?", "who"]):
+            motion = "TILT"
+        elif any(w in lower or w in prompt for w in ["ばか", "ダメ", "no", "not", "嫌", "バカ"]):
+            motion = "SHAKE"
+
+        clean_reply = re.sub(r"\[.*?\]", "", japanese_reply).strip() or japanese_reply
+        call_fish_audio(clean_reply)
+        snapshot = speech_state.queue_new_audio(clean_reply, motion=motion)
+        log(f"[Server] Audio queued seq={snapshot['seq']} motion={motion}")
         return {
             "ok": True,
             "seq": snapshot["seq"],
-            "text": japanese_reply,
+            "text": clean_reply,
+            "reply": clean_reply,
+            "motion": motion,
             "audio_url": snapshot["audio_url"],
         }
 
 
-def call_gemini_audio_persona(audio_bytes: bytes) -> tuple[str, str]:
+def call_gemini_audio_persona(audio_bytes: bytes) -> tuple[str, str, str]:
     if not CONFIG.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured.")
 
@@ -746,12 +767,18 @@ def call_gemini_audio_persona(audio_bytes: bytes) -> tuple[str, str]:
         "Listen to Haru (ハル) speaking in this audio.\n"
         "1. Transcribe Haru's spoken words verbatim in their original language (Japanese or English). "
         "If inaudible or no clear speech is heard, set transcript to \"\".\n"
-        "2. Formulate Ram's spoken response to Haru according to the Ram persona:\n"
+        "2. Select an animatronic robot gesture for Ram in 'motion':\n"
+        "   - 'TILT': Inquisitive, questioning, skeptical, or mocking head tilt.\n"
+        "   - 'NOD': Acknowledging, affirming, or confident agreement.\n"
+        "   - 'SHAKE': Disapproval, sighing, exasperation, or refusal.\n"
+        "   - 'WAVE': Greeting, saying hello/goodbye, or calling attention.\n"
+        "   - 'IDLE': Neutral, observant, or default posture.\n"
+        "3. Formulate Ram's spoken response to Haru according to the Ram persona:\n"
         "   - Calm, sharp-tongued, sarcastic, confident, observant, slightly condescending, secretly caring.\n"
         "   - Always address Haru up-front (for example: 「ハル、...」).\n"
         "   - Strictly 1 concise sentence in Japanese, under 30 Japanese characters total.\n"
         "   - Spoken dialogue only (no English words, tone labels, or explanations).\n"
-        "Output valid JSON conforming to the schema with properties 'transcript' and 'reply'."
+        "Output valid JSON conforming to the schema with properties 'transcript', 'motion', and 'reply'."
     )
 
     generate_config_cls = getattr(types, "GenerateContentConfig", None)
@@ -794,16 +821,20 @@ def call_gemini_audio_persona(audio_bytes: bytes) -> tuple[str, str]:
 
             parsed = parse_json_safely(raw_text)
             transcript = str(parsed.get("transcript", "")).strip()
+            motion = str(parsed.get("motion", "IDLE")).strip().upper()
             reply = str(parsed.get("reply", "")).strip()
 
-            if not reply:
-                reply = "……なに？少し忙しくて聞こえなかったわ。もう一度言いなさいよ、ハル。"
+            clean_reply = re.sub(r"\[.*?\]", "", reply).strip() or reply
+            if not clean_reply:
+                clean_reply = "……なに？少し忙しくて聞こえなかったわ。もう一度言いなさいよ、ハル。"
             if not transcript:
                 transcript = "（ハルが話しかけたが聞き取れなかった）"
+            if motion not in {"TILT", "NOD", "SHAKE", "WAVE", "IDLE"}:
+                motion = "IDLE"
 
-            log(f"[SinglePass SUCCESS] Transcript: {transcript!r} | Reply: {reply!r}")
+            log(f"[SinglePass SUCCESS] Transcript: {transcript!r} | Motion: {motion} | Reply: {clean_reply!r}")
             speech_state.last_gemini_error = ""
-            return transcript, reply
+            return transcript, motion, clean_reply
         except Exception as exc:
             last_error = exc
             log(f"[SinglePass WARN] Model {model_name} failed: {exc}")
@@ -812,14 +843,15 @@ def call_gemini_audio_persona(audio_bytes: bytes) -> tuple[str, str]:
     log(f"[SinglePass ERROR] All single-pass models failed ({last_error}). Falling back to sequential STT + LLM.")
     transcript = transcribe_audio(audio_bytes) or "（ハルが話しかけたが聞き取れなかった）"
     reply = call_gemini(transcript)
-    return transcript, reply
+    clean_reply = re.sub(r"\[.*?\]", "", reply).strip() or reply
+    return transcript, "IDLE", clean_reply
 
 
 def call_gemini_vision_audio_persona(
     image_bytes: bytes,
     audio_bytes: bytes | None = None,
     text_prompt: str | None = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     if not CONFIG.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured.")
 
@@ -841,18 +873,25 @@ def call_gemini_vision_audio_persona(
         vision_prompt = (
             "You are observing Haru (ハル) through your desktop robot's camera and listening to his voice.\n"
             "1. Transcribe Haru's spoken words verbatim in their original language. If inaudible or silent, set transcript to \"\".\n"
-            "2. Observe Haru's facial expression, posture, clothing, objects held, or desk workspace in the image.\n"
-            "3. Generate Ram's spoken response: calm, sharp-tongued, sarcastic, confident, observant. "
+            "2. Select an animatronic robot gesture for Ram in 'motion':\n"
+            "   - 'TILT': Inquisitive, questioning, skeptical, or mocking head tilt.\n"
+            "   - 'NOD': Acknowledging, affirming, or confident agreement.\n"
+            "   - 'SHAKE': Disapproval, sighing, exasperation, or refusal.\n"
+            "   - 'WAVE': Greeting, saying hello/goodbye, or calling attention.\n"
+            "   - 'IDLE': Neutral, observant, or default posture.\n"
+            "3. Observe Haru's facial expression, posture, clothing, objects held, or desk workspace in the image.\n"
+            "4. Generate Ram's spoken response: calm, sharp-tongued, sarcastic, confident, observant. "
             "Address Haru up-front (e.g. 「ハル、...」). Strictly 1 concise sentence in Japanese, under 40 Japanese characters total.\n"
-            "Output valid JSON conforming to the schema with 'transcript' and 'reply'."
+            "Output valid JSON conforming to the schema with 'transcript', 'motion', and 'reply'."
         )
     else:
         vision_prompt = (
             f"Context: {text_prompt or 'Haru is standing in front of your camera'}\n"
-            "Observe Haru's facial expression, posture, clothing, objects held, or desk workspace in the image.\n"
-            "Generate Ram's spoken response: calm, sharp-tongued, sarcastic, confident, observant. "
+            "1. Select an animatronic robot gesture for Ram in 'motion': 'TILT', 'NOD', 'SHAKE', 'WAVE', or 'IDLE'.\n"
+            "2. Observe Haru's facial expression, posture, clothing, objects held, or desk workspace in the image.\n"
+            "3. Generate Ram's spoken response: calm, sharp-tongued, sarcastic, confident, observant. "
             "Address Haru up-front (e.g. 「ハル、...」). Strictly 1 concise sentence in Japanese, under 40 Japanese characters total.\n"
-            "Output valid JSON conforming to the schema with 'transcript' and 'reply'."
+            "Output valid JSON conforming to the schema with 'transcript', 'motion', and 'reply'."
         )
 
     contents.append(vision_prompt)
@@ -892,21 +931,25 @@ def call_gemini_vision_audio_persona(
 
             parsed = parse_json_safely(raw_text)
             transcript = str(parsed.get("transcript", "")).strip()
+            motion = str(parsed.get("motion", "IDLE")).strip().upper()
             reply = str(parsed.get("reply", "")).strip()
 
-            if not reply:
-                reply = "ラムの目を節穴だと思っているのかしら、ハル。何もかも丸見えよ。"
+            clean_reply = re.sub(r"\[.*?\]", "", reply).strip() or reply
+            if not clean_reply:
+                clean_reply = "ラムの目を節穴だと思っているのかしら、ハル。何もかも丸見えよ。"
             if not transcript and text_prompt:
                 transcript = text_prompt
+            if motion not in {"TILT", "NOD", "SHAKE", "WAVE", "IDLE"}:
+                motion = "IDLE"
 
-            log(f"[Vision SinglePass SUCCESS] Transcript: {transcript!r} | Reply: {reply!r}")
-            return transcript, reply
+            log(f"[Vision SinglePass SUCCESS] Transcript: {transcript!r} | Motion: {motion} | Reply: {clean_reply!r}")
+            return transcript, motion, clean_reply
         except Exception as exc:
             log(f"[Vision SinglePass WARN] Model {model_name} failed: {exc}")
             time.sleep(0.3)
 
     log("[Vision SinglePass ERROR] All models failed. Using default fallback.")
-    return text_prompt or "(視覚観察)", "ラムの目を節穴だと思っているのかしら、ハル。何もかも丸見えよ。"
+    return text_prompt or "(視覚観察)", "IDLE", "ラムの目を節穴だと思っているのかしら、ハル。何もかも丸見えよ。"
 
 
 def process_voice_prompt(audio_bytes: bytes) -> dict[str, Any]:
@@ -914,14 +957,15 @@ def process_voice_prompt(audio_bytes: bytes) -> dict[str, Any]:
         raise ValueError("Missing audio data.")
 
     with process_lock:
-        transcript, japanese_reply = call_gemini_audio_persona(audio_bytes)
+        transcript, motion, japanese_reply = call_gemini_audio_persona(audio_bytes)
         call_fish_audio(japanese_reply)
-        snapshot = speech_state.queue_new_audio(japanese_reply)
-        log(f"[Server] Voice audio queued seq={snapshot['seq']} for transcript={transcript!r}")
+        snapshot = speech_state.queue_new_audio(japanese_reply, motion=motion)
+        log(f"[Server] Voice audio queued seq={snapshot['seq']} motion={motion} for transcript={transcript!r}")
         return {
             "ok": True,
             "seq": snapshot["seq"],
             "transcript": transcript,
+            "motion": motion,
             "reply": japanese_reply,
             "text": japanese_reply,
             "audio_url": snapshot["audio_url"],
@@ -939,18 +983,19 @@ def process_vision_prompt(
     log(f"[Vision] Processing image ({len(image_bytes)} bytes)...")
 
     with process_lock:
-        transcript, japanese_reply = call_gemini_vision_audio_persona(
+        transcript, motion, japanese_reply = call_gemini_vision_audio_persona(
             image_bytes=image_bytes,
             audio_bytes=audio_bytes,
             text_prompt=text_prompt,
         )
         call_fish_audio(japanese_reply)
-        snapshot = speech_state.queue_new_audio(japanese_reply)
-        log(f"[Server] Vision audio queued seq={snapshot['seq']}")
+        snapshot = speech_state.queue_new_audio(japanese_reply, motion=motion)
+        log(f"[Server] Vision audio queued seq={snapshot['seq']} motion={motion}")
         return {
             "ok": True,
             "seq": snapshot["seq"],
             "transcript": transcript,
+            "motion": motion,
             "reply": japanese_reply,
             "text": japanese_reply,
             "audio_url": snapshot["audio_url"],
