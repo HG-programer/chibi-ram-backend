@@ -340,6 +340,28 @@ def extract_request_token(handler: BaseHTTPRequestHandler, query: dict[str, list
     return ""
 
 
+def parse_json_safely(raw_text: str) -> dict[str, Any]:
+    text = raw_text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return json.loads(text)
+
+
+UNIFIED_AUDIO_PERSONA_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "transcript": {"type": "STRING"},
+        "reply": {"type": "STRING"},
+    },
+    "required": ["transcript", "reply"],
+}
+
+
 # ============================================================
 # GEMINI
 # ============================================================
@@ -705,19 +727,194 @@ def process_prompt(prompt: str) -> dict[str, Any]:
         }
 
 
+def call_gemini_audio_persona(audio_bytes: bytes) -> tuple[str, str]:
+    if not CONFIG.gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    processed_audio = normalize_and_convert_mono(audio_bytes)
+
+    try:
+        from google import genai
+        from google.genai import types
+    except Exception as exc:
+        raise RuntimeError("google-genai is not installed or could not be imported.") from exc
+
+    client = genai.Client(api_key=CONFIG.gemini_api_key)
+    audio_part = types.Part.from_bytes(data=processed_audio, mime_type="audio/wav")
+
+    unified_prompt = (
+        "Listen to Haru (ハル) speaking in this audio.\n"
+        "1. Transcribe Haru's spoken words verbatim in their original language (Japanese or English). "
+        "If inaudible or no clear speech is heard, set transcript to \"\".\n"
+        "2. Formulate Ram's spoken response to Haru according to the Ram persona:\n"
+        "   - Calm, sharp-tongued, sarcastic, confident, observant, slightly condescending, secretly caring.\n"
+        "   - Always address Haru up-front (for example: 「ハル、...」).\n"
+        "   - Strictly 1 concise sentence in Japanese, under 30 Japanese characters total.\n"
+        "   - Spoken dialogue only (no English words, tone labels, or explanations).\n"
+        "Output valid JSON conforming to the schema with properties 'transcript' and 'reply'."
+    )
+
+    generate_config_cls = getattr(types, "GenerateContentConfig", None)
+    config = (
+        generate_config_cls(
+            system_instruction=RAM_SYSTEM_INSTRUCTION,
+            temperature=0.7,
+            max_output_tokens=150,
+            response_mime_type="application/json",
+            response_schema=UNIFIED_AUDIO_PERSONA_SCHEMA,
+        )
+        if generate_config_cls
+        else None
+    )
+
+    models_to_try = [
+        "gemini-2.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-flash-lite-latest",
+        "gemini-3.5-flash",
+    ]
+    if GEMINI_MODEL_ID not in models_to_try:
+        models_to_try.insert(0, GEMINI_MODEL_ID)
+
+    last_error: Exception | None = None
+    for model_name in models_to_try:
+        try:
+            log(f"[SinglePass] Requesting {model_name} for audio-to-persona...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[audio_part, unified_prompt],
+                config=config,
+            )
+            if CONFIG.debug:
+                log_gemini_debug(response)
+
+            raw_text = extract_gemini_text(response).strip()
+            log(f"[SinglePass] ({model_name}) Raw text: {raw_text!r}")
+
+            parsed = parse_json_safely(raw_text)
+            transcript = str(parsed.get("transcript", "")).strip()
+            reply = str(parsed.get("reply", "")).strip()
+
+            if not reply:
+                reply = "……なに？少し忙しくて聞こえなかったわ。もう一度言いなさいよ、ハル。"
+            if not transcript:
+                transcript = "（ハルが話しかけたが聞き取れなかった）"
+
+            log(f"[SinglePass SUCCESS] Transcript: {transcript!r} | Reply: {reply!r}")
+            speech_state.last_gemini_error = ""
+            return transcript, reply
+        except Exception as exc:
+            last_error = exc
+            log(f"[SinglePass WARN] Model {model_name} failed: {exc}")
+            time.sleep(0.3)
+
+    log(f"[SinglePass ERROR] All single-pass models failed ({last_error}). Falling back to sequential STT + LLM.")
+    transcript = transcribe_audio(audio_bytes) or "（ハルが話しかけたが聞き取れなかった）"
+    reply = call_gemini(transcript)
+    return transcript, reply
+
+
+def call_gemini_vision_audio_persona(
+    image_bytes: bytes,
+    audio_bytes: bytes | None = None,
+    text_prompt: str | None = None,
+) -> tuple[str, str]:
+    if not CONFIG.gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    try:
+        from google import genai
+        from google.genai import types
+    except Exception as exc:
+        raise RuntimeError("google-genai is not installed or could not be imported.") from exc
+
+    client = genai.Client(api_key=CONFIG.gemini_api_key)
+    image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+
+    contents: list[Any] = [image_part]
+
+    if audio_bytes and len(audio_bytes) > 200:
+        processed_audio = normalize_and_convert_mono(audio_bytes)
+        audio_part = types.Part.from_bytes(data=processed_audio, mime_type="audio/wav")
+        contents.append(audio_part)
+        vision_prompt = (
+            "You are observing Haru (ハル) through your desktop robot's camera and listening to his voice.\n"
+            "1. Transcribe Haru's spoken words verbatim in their original language. If inaudible or silent, set transcript to \"\".\n"
+            "2. Observe Haru's facial expression, posture, clothing, objects held, or desk workspace in the image.\n"
+            "3. Generate Ram's spoken response: calm, sharp-tongued, sarcastic, confident, observant. "
+            "Address Haru up-front (e.g. 「ハル、...」). Strictly 1 concise sentence in Japanese, under 40 Japanese characters total.\n"
+            "Output valid JSON conforming to the schema with 'transcript' and 'reply'."
+        )
+    else:
+        vision_prompt = (
+            f"Context: {text_prompt or 'Haru is standing in front of your camera'}\n"
+            "Observe Haru's facial expression, posture, clothing, objects held, or desk workspace in the image.\n"
+            "Generate Ram's spoken response: calm, sharp-tongued, sarcastic, confident, observant. "
+            "Address Haru up-front (e.g. 「ハル、...」). Strictly 1 concise sentence in Japanese, under 40 Japanese characters total.\n"
+            "Output valid JSON conforming to the schema with 'transcript' and 'reply'."
+        )
+
+    contents.append(vision_prompt)
+
+    generate_config_cls = getattr(types, "GenerateContentConfig", None)
+    config = (
+        generate_config_cls(
+            system_instruction=RAM_SYSTEM_INSTRUCTION,
+            temperature=0.75,
+            max_output_tokens=150,
+            response_mime_type="application/json",
+            response_schema=UNIFIED_AUDIO_PERSONA_SCHEMA,
+        )
+        if generate_config_cls
+        else None
+    )
+
+    models_to_try = [
+        "gemini-2.5-flash",
+        "gemini-3.5-flash",
+        "gemini-flash-latest",
+        "gemini-3.5-flash-lite",
+    ]
+    if GEMINI_MODEL_ID not in models_to_try:
+        models_to_try.insert(0, GEMINI_MODEL_ID)
+
+    for model_name in models_to_try:
+        try:
+            log(f"[Vision SinglePass] Requesting {model_name}...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config,
+            )
+            raw_text = extract_gemini_text(response).strip()
+            log(f"[Vision SinglePass] ({model_name}) Raw text: {raw_text!r}")
+
+            parsed = parse_json_safely(raw_text)
+            transcript = str(parsed.get("transcript", "")).strip()
+            reply = str(parsed.get("reply", "")).strip()
+
+            if not reply:
+                reply = "ラムの目を節穴だと思っているのかしら、ハル。何もかも丸見えよ。"
+            if not transcript and text_prompt:
+                transcript = text_prompt
+
+            log(f"[Vision SinglePass SUCCESS] Transcript: {transcript!r} | Reply: {reply!r}")
+            return transcript, reply
+        except Exception as exc:
+            log(f"[Vision SinglePass WARN] Model {model_name} failed: {exc}")
+            time.sleep(0.3)
+
+    log("[Vision SinglePass ERROR] All models failed. Using default fallback.")
+    return text_prompt or "(視覚観察)", "ラムの目を節穴だと思っているのかしら、ハル。何もかも丸見えよ。"
+
+
 def process_voice_prompt(audio_bytes: bytes) -> dict[str, Any]:
     if not audio_bytes:
         raise ValueError("Missing audio data.")
 
-    # 1. Transcribe speech using Gemini 3.5 Transcribe
-    transcript = transcribe_audio(audio_bytes)
-    if not transcript:
-        log("[Transcribe WARN] No speech recognized in audio. Using prompt fallback.")
-        transcript = "ハルが何か話しかけたが、声が小さくて聞き取れなかった"
-
-    # 2. Process through existing persona and Fish Audio pipeline
     with process_lock:
-        japanese_reply = call_gemini(transcript)
+        transcript, japanese_reply = call_gemini_audio_persona(audio_bytes)
         call_fish_audio(japanese_reply)
         snapshot = speech_state.queue_new_audio(japanese_reply)
         log(f"[Server] Voice audio queued seq={snapshot['seq']} for transcript={transcript!r}")
@@ -741,83 +938,12 @@ def process_vision_prompt(
 
     log(f"[Vision] Processing image ({len(image_bytes)} bytes)...")
 
-    # 1. Transcribe speech if voice audio was provided
-    transcript = ""
-    if audio_bytes and len(audio_bytes) > 200:
-        try:
-            transcript = transcribe_audio(audio_bytes)
-        except Exception as exc:
-            log(f"[Vision WARN] Audio transcription failed: {exc}")
-
-    if not transcript:
-        if text_prompt and text_prompt.strip():
-            transcript = text_prompt.strip()
-        else:
-            transcript = "（ハルが無言でラムのカメラの前に立っている、または何かを見せている）"
-
-    # 2. Call Gemini Vision
-    try:
-        from google import genai
-        from google.genai import types
-    except Exception as exc:
-        raise RuntimeError("google-genai is not installed or could not be imported.") from exc
-
-    client = genai.Client(api_key=CONFIG.gemini_api_key)
-    image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
-
-    vision_system_instruction = (
-        "You are Ram (ラム), the pink-haired twin maid from Re:Zero. "
-        "You are observing Haru (ハル) through your desktop robot's OV3660 camera. "
-        f"Context / Speech from Haru: {transcript!r}. "
-        "Carefully observe Haru's facial expression, posture, clothing, objects held, or desk workspace in the image. "
-        "React and respond in your signature Ram persona: calm, sharp-tongued, sarcastic, confident, observant. "
-        "Keep your spoken response concise, sharp, and punchy (strictly 1 to 2 brief sentences, under 50 Japanese characters total). "
-        "Always respond in Japanese suitable for TTS."
-    )
-
-    models_to_try = [
-        "gemini-flash-latest",
-        "gemini-3.5-flash",
-        "gemini-flash-lite-latest",
-        "gemini-2.5-flash-lite",
-    ]
-    if GEMINI_MODEL_ID not in models_to_try:
-        models_to_try.insert(0, GEMINI_MODEL_ID)
-
-    generate_config_cls = getattr(types, "GenerateContentConfig", None)
-    config = (
-        generate_config_cls(
-            system_instruction=vision_system_instruction,
-            temperature=0.75,
-            max_output_tokens=150,
-        )
-        if generate_config_cls
-        else None
-    )
-
-    japanese_reply = ""
-    for model_name in models_to_try:
-        try:
-            log(f"[Vision] Requesting model {model_name}...")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=[image_part, "ハルの姿や周囲を観察して、ラムらしく簡潔に一言コメントしなさい。"],
-                config=config,
-            )
-            japanese_reply = extract_gemini_text(response).strip()
-            if japanese_reply:
-                log(f"[Vision] ({model_name}) Ram: {japanese_reply}")
-                speech_state.last_gemini_error = ""
-                break
-        except Exception as exc:
-            log(f"[Vision WARN] Model {model_name} vision failed: {exc}")
-            time.sleep(0.3)
-
-    if not japanese_reply:
-        japanese_reply = "ラムの目を節穴だと思っているのかしら、ハル。何もかも丸見えよ。"
-
-    # 3. Synthesize speech via Fish Audio
     with process_lock:
+        transcript, japanese_reply = call_gemini_vision_audio_persona(
+            image_bytes=image_bytes,
+            audio_bytes=audio_bytes,
+            text_prompt=text_prompt,
+        )
         call_fish_audio(japanese_reply)
         snapshot = speech_state.queue_new_audio(japanese_reply)
         log(f"[Server] Vision audio queued seq={snapshot['seq']}")
