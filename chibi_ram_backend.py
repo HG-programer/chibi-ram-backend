@@ -354,7 +354,7 @@ UNIFIED_AUDIO_PERSONA_SCHEMA = {
         "transcript": {"type": "STRING"},
         "motion": {
             "type": "STRING",
-            "enum": ["TILT", "NOD", "SHAKE", "WAVE", "IDLE"],
+            "enum": ["TILT", "NOD", "SHAKE", "WAVE", "BOW", "IDLE"],
         },
         "reply": {"type": "STRING"},
     },
@@ -718,8 +718,10 @@ def process_prompt(prompt: str) -> dict[str, Any]:
         japanese_reply = call_gemini(prompt)
         motion = "NOD"
         lower = prompt.lower()
-        if any(w in lower or w in prompt for w in ["こんにちは", "hello", "hi", "おはよう", "wave"]):
-            motion = "WAVE"
+        if any(w in lower or w in prompt for w in ["おかえり", "ただいま", "welcome", "bow", "お辞儀", "礼", "よろしく"]):
+            motion = "BOW"
+        elif any(w in lower or w in prompt for w in ["こんにちは", "hello", "hi", "おはよう", "wave"]):
+            motion = "BOW"
         elif any(w in lower or w in prompt for w in ["どう", "なんで", "why", "what", "？", "?", "who"]):
             motion = "TILT"
         elif any(w in lower or w in prompt for w in ["ばか", "ダメ", "no", "not", "嫌", "バカ"]):
@@ -759,6 +761,7 @@ def call_gemini_audio_persona(audio_bytes: bytes) -> tuple[str, str, str]:
         "1. Transcribe Haru-sama's spoken words verbatim in their original language (Japanese or English). "
         "If inaudible or no clear speech is heard, set transcript to \"\".\n"
         "2. Select an animatronic robot gesture for Ram in 'motion':\n"
+        "   - 'BOW': Respectful, elegant maid bow when greeting, welcoming home, thanking, or receiving an instruction from Haru-sama.\n"
         "   - 'TILT': Inquisitive, affectionate, or gentle head tilt.\n"
         "   - 'NOD': Respectful acknowledgment, affirmation, or polite agreement.\n"
         "   - 'SHAKE': Gentle concern, slight worry for his health, or soft decline.\n"
@@ -821,7 +824,7 @@ def call_gemini_audio_persona(audio_bytes: bytes) -> tuple[str, str, str]:
                 clean_reply = "ハル様、お声が少し遠かったようです。もう一度お聞かせ願えますか？"
             if not transcript:
                 transcript = "（ハル様がお話しになりました）"
-            if motion not in {"TILT", "NOD", "SHAKE", "WAVE", "IDLE"}:
+            if motion not in {"TILT", "NOD", "SHAKE", "WAVE", "BOW", "IDLE"}:
                 motion = "IDLE"
 
             log(f"[SinglePass SUCCESS] Transcript: {transcript!r} | Motion: {motion} | Reply: {clean_reply!r}")
@@ -866,6 +869,7 @@ def call_gemini_vision_audio_persona(
             "You are observing your beloved creator and master, Haru (ハル様), through your desktop robot's camera and listening to his voice.\n"
             "1. Transcribe Haru-sama's spoken words verbatim in their original language. If inaudible or silent, set transcript to \"\".\n"
             "2. Select an animatronic robot gesture for Ram in 'motion':\n"
+            "   - 'BOW': Respectful, elegant maid bow when greeting, welcoming home, thanking, or receiving an instruction from Haru-sama.\n"
             "   - 'TILT': Inquisitive, affectionate, or gentle head tilt.\n"
             "   - 'NOD': Respectful acknowledgment, affirmation, or polite agreement.\n"
             "   - 'SHAKE': Gentle concern, slight worry for his health, or soft decline.\n"
@@ -879,7 +883,7 @@ def call_gemini_vision_audio_persona(
     else:
         vision_prompt = (
             f"Context: {text_prompt or 'Haru-sama is showing himself or his workspace to Ram'}\n"
-            "1. Select an animatronic robot gesture for Ram in 'motion': 'TILT', 'NOD', 'SHAKE', 'WAVE', or 'IDLE'.\n"
+            "1. Select an animatronic robot gesture for Ram in 'motion': 'BOW', 'TILT', 'NOD', 'SHAKE', 'WAVE', or 'IDLE'.\n"
             "2. Observe Haru-sama and his workspace with warm, devoted attentiveness.\n"
             "3. Generate Ram's spoken response: devoted, caring, graceful, and lovingly attentive. "
             "Address him as 「ハル様、...」. Strictly 1 concise sentence in Japanese, under 40 Japanese characters total.\n"
@@ -931,7 +935,7 @@ def call_gemini_vision_audio_persona(
                 clean_reply = "ハル様のお姿、ラムのこの目でしっかりと見つめておりますわ。"
             if not transcript and text_prompt:
                 transcript = text_prompt
-            if motion not in {"TILT", "NOD", "SHAKE", "WAVE", "IDLE"}:
+            if motion not in {"TILT", "NOD", "SHAKE", "WAVE", "BOW", "IDLE"}:
                 motion = "IDLE"
 
             log(f"[Vision SinglePass SUCCESS] Transcript: {transcript!r} | Motion: {motion} | Reply: {clean_reply!r}")
