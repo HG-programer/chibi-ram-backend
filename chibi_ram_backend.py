@@ -1011,6 +1011,8 @@ def call_gemini_vision_audio_persona(
                 clean_reply = "……どちら様かしら？ ハル様の席から離れてくださる？" if identity == "STRANGER" else "ハル様のお姿、ラムのこの目でしっかりと見つめておりますわ。"
             if not transcript and text_prompt:
                 transcript = text_prompt
+            if not transcript:
+                transcript = "(Unknown person appeared at Haru's desk)" if identity == "STRANGER" else "(Haru showed himself to Ram)"
             if motion not in {"TILT", "NOD", "SHAKE", "WAVE", "BOW", "IDLE"}:
                 motion = "SHAKE" if identity == "STRANGER" else "IDLE"
 
@@ -1022,7 +1024,8 @@ def call_gemini_vision_audio_persona(
 
     log("[Vision SinglePass ERROR] All models failed. Using default fallback.")
     fallback_reply = "……どちら様かしら？ ハル様の席から離れてくださる？" if identity == "STRANGER" else "ハル様のお姿、ラムのこの目でしっかりと見つめておりますわ。"
-    return text_prompt or "(視覚観察)", "SHAKE" if identity == "STRANGER" else "IDLE", "cold" if identity == "STRANGER" else "gentle", fallback_reply
+    fallback_transcript = text_prompt or ("(Unknown person appeared at Haru's desk)" if identity == "STRANGER" else "(Haru showed himself to Ram)")
+    return fallback_transcript, "SHAKE" if identity == "STRANGER" else "IDLE", "cold" if identity == "STRANGER" else "gentle", fallback_reply
 
 
 def process_voice_prompt(audio_bytes: bytes) -> dict[str, Any]:
