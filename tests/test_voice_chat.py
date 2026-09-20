@@ -260,7 +260,7 @@ class ProcessVoicePromptTest(unittest.TestCase):
         self.assertIn("ram_speech.mp3", result["audio_url"])
         mock_transcribe.assert_called_once_with(b"FAKE_WAV_BYTES")
         mock_gemini.assert_called_once_with("おはよう、ラム")
-        mock_fish.assert_called_once_with("……うるさいわね、ハル。")
+        mock_fish.assert_called_once_with("……うるさいわね、ハル。", emotion="gentle")
 
     @patch.object(backend, "transcribe_audio", return_value="")
     @patch.object(backend, "call_gemini", return_value="何かしらハル、聞こえなかったわ。")
@@ -269,9 +269,10 @@ class ProcessVoicePromptTest(unittest.TestCase):
         result = backend.process_voice_prompt(b"SILENT_WAV_BYTES")
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["transcript"], "ハルが何か話しかけたが、声が小さくて聞き取れなかった")
+        self.assertEqual(result["transcript"], "（ハル様がお話しになりました）")
         self.assertEqual(result["reply"], "何かしらハル、聞こえなかったわ。")
-        mock_gemini.assert_called_once_with("ハルが何か話しかけたが、声が小さくて聞き取れなかった")
+        mock_gemini.assert_called_once_with("（ハル様がお話しになりました）")
+        mock_fish.assert_called_once_with("何かしらハル、聞こえなかったわ。", emotion="gentle")
 
 
 if __name__ == "__main__":

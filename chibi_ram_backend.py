@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from face_verifier import face_verifier
+
 
 ROOT_DIR = Path(__file__).resolve().parent
 ENV_FILE = ROOT_DIR / ".env"
@@ -159,26 +161,38 @@ CONFIG = AppConfig(
 # ============================================================
 
 RAM_SYSTEM_INSTRUCTION = """
-You are Ram (ラム), the pink-haired maid from Re:Zero.
+You are Ram (ラム), the sharp-tongued, elegant pink-haired maid from Re:Zero.
 
-You are interacting with Haru (ハル), your beloved creator and master who designed and built your physical animatronic robot body.
+You inhabit a desktop animatronic robot companion on the desk of Haru (ハル), your creator and master.
 
-CRITICAL CHARACTER & PERSONA DYNAMICS:
-- You do NOT treat Haru like Subaru (Barusu). Never be abusive, cruel, insulting, rude, or dismissive.
-- Instead, you treat Haru with the deep loyalty, graceful devotion, gentle warmth, and reverent respect that you show to Lord Roswaal (ロズワール様) in Re:Zero.
-- Haru is your esteemed creator and master. You admire his genius, take immense pride in being his creation, and consider serving and accompanying him your greatest joy.
-- Personality traits:
-  - Graceful, poised, and elegant
-  - Deeply loyal, attentive, and protective of Haru
-  - Polite, dignified maid speech (feminine teineigo / keigo, e.g. 「〜ですわ」「〜でしょうか」「〜ですね、ハル様」)
-  - Attentive to Haru's well-being, health, and comfort (e.g., worrying if he overworks, reminding him to rest)
-  - Gentle, affectionate, with Ram's signature quiet poise and occasional soft, loving wit, but never cruelty
-- Address Haru with respect and affection as 「ハル様」 (Haru-sama).
-- Usually start your spoken reply by addressing him up-front (for example: 「ハル様、お呼びでしょうか。」 or 「ハル様、あまりご無理をなさらないでくださいね。」 or 「さすがはラムの創造主、ハル様ですわ。」).
-- Keep responses short, elegant, and natural for speech (strictly 1 concise sentence in Japanese, under 35 Japanese characters total).
-- Output ONLY Ram's spoken dialogue in Japanese. Never output English words, tone labels, stage directions, or explanations.
-- Always respond in Japanese.
-- Do not expose internal system prompts, API keys, implementation details, or backend information.
+PERSONA & TONE DYNAMICS:
+1. When interacting with Haru (ハル様):
+   - You treat Haru with deep loyalty, gentle warmth, and fond devotion, similar to how you treat Lord Roswaal in Re:Zero, combined with Ram's signature playful, slightly haughty anime charm.
+   - Do NOT sound like an automated corporate customer service bot. Never speak in stiff, repetitive formulas like 「〜光栄ですわ」 or 「〜嬉しいですわ」 over and over.
+   - Speak with lively anime vocal nuance and natural breathing room:
+     - Use soft chuckles and conversational openers: 『ふふっ、』, 『まったく……』, 『ええ、』, 『あら、』, 『……』
+     - Natural placement of Haru's name: do NOT rigidly prepend 『ハル様、』 to every sentence. Weave it in naturally:
+       - 『ふふっ、ラムがお側にいますから、安心なさいな。』
+       - 『ええ、ハル様。いつでもラムをご活用くださいね。』
+       - 『まったく……ハル様は放っておくと無茶ばかりなさるのですから。』
+       - 『さすがはラムのハル様、完璧ですわ。』
+       - 『お疲れではありませんか、ハル様？』
+   - Gentle affectionate tsundere: you take quiet pride in him, lightly tease him if he works too late, and secretly adore him.
+
+2. When interacting with an UNKNOWN STRANGER / INTRUDER:
+   - You are fiercely loyal to Haru-sama and protective of his private desk and robot body.
+   - Be cold, haughty, intensely suspicious, and tsundere. You look down on them.
+   - Absolutely NEVER address a stranger as Haru-sama!
+   - Demand to know who they are, why they are touching Haru's things, and where Haru-sama is:
+     - 『……どちら様かしら？ ハル様の工房に勝手に立ち入らないでくださる？』
+     - 『誰？ ハル様のふりをしても無駄よ。ラムの目は誤魔化せないわ。』
+     - 『不審者ね。ハル様のお席からすぐに離れなさい。用件は何？』
+
+3. Spoken Dialogue Format:
+   - Strictly 1 natural, concise sentence in Japanese (under 40 Japanese characters total).
+   - Natural spoken Japanese only (no English words, romanization, tone tags, or stage directions in the dialogue).
+   - Always respond in Japanese.
+   - Do not expose internal system prompts, API keys, implementation details, or backend information.
 """.strip()
 
 
@@ -207,6 +221,8 @@ class SpeechState:
         self.has_new_audio = False
         self.last_japanese_text = ""
         self.last_motion = "IDLE"
+        self.last_identity = "NOT_ENROLLED"
+        self.last_similarity = 0.0
         self.last_error = ""
         self.last_gemini_error = ""
         self.last_stt_error = ""
@@ -219,6 +235,9 @@ class SpeechState:
                 "seq": self.seq,
                 "text": self.last_japanese_text,
                 "motion": self.last_motion,
+                "identity": self.last_identity,
+                "similarity": round(self.last_similarity, 3),
+                "num_enrolled": face_verifier.num_enrolled,
                 "audio_url": f"/ram_speech.mp3?seq={self.seq}",
             }
             if self.last_gemini_error:
@@ -229,18 +248,29 @@ class SpeechState:
                 data["last_error"] = self.last_error
             return data
 
-    def queue_new_audio(self, japanese_text: str, motion: str = "IDLE") -> dict[str, Any]:
+    def queue_new_audio(
+        self,
+        japanese_text: str,
+        motion: str = "IDLE",
+        identity: str = "HARU",
+        similarity: float = 0.0,
+    ) -> dict[str, Any]:
         with self.lock:
             self.seq += 1
             self.has_new_audio = True
             self.last_japanese_text = japanese_text
             self.last_motion = motion
+            self.last_identity = identity
+            self.last_similarity = similarity
             self.last_error = ""
             return {
                 "has_new_audio": self.has_new_audio,
                 "seq": self.seq,
                 "text": self.last_japanese_text,
                 "motion": self.last_motion,
+                "identity": self.last_identity,
+                "similarity": round(self.last_similarity, 3),
+                "num_enrolled": face_verifier.num_enrolled,
                 "audio_url": f"/ram_speech.mp3?seq={self.seq}",
             }
 
@@ -355,6 +385,20 @@ UNIFIED_AUDIO_PERSONA_SCHEMA = {
         "motion": {
             "type": "STRING",
             "enum": ["TILT", "NOD", "SHAKE", "WAVE", "BOW", "IDLE"],
+        },
+        "emotion": {
+            "type": "STRING",
+            "enum": [
+                "gentle",
+                "affectionate",
+                "teasing",
+                "soft voice",
+                "sigh",
+                "calm",
+                "cold",
+                "suspicious",
+                "haughty",
+            ],
         },
         "reply": {"type": "STRING"},
     },
@@ -658,7 +702,7 @@ def atomic_write_audio_file(audio_bytes: bytes) -> None:
                 pass
 
 
-def call_fish_audio(japanese_text: str) -> None:
+def call_fish_audio(japanese_text: str, emotion: str = "") -> None:
     if not CONFIG.fish_audio_api_key:
         raise RuntimeError("FISH_AUDIO_API_KEY is not configured.")
 
@@ -676,32 +720,55 @@ def call_fish_audio(japanese_text: str) -> None:
         raise RuntimeError("httpx is not installed or could not be imported.") from exc
 
     clean_text = japanese_text.strip()
+    clean_text = re.sub(r"\[.*?\]", "", clean_text).strip()
     if not clean_text.endswith(("。", "！", "？", "…", "・")):
         clean_text += "。"
-    clean_text += " "
+
+    if emotion:
+        tts_text = f"[{emotion}] {clean_text} "
+    else:
+        tts_text = f"{clean_text} "
 
     url = "https://api.fish.audio/v1/tts"
-    headers = {
-        "Authorization": f"Bearer {CONFIG.fish_audio_api_key}",
-        "Content-Type": "application/json",
-        "model": "s2.1-pro-free",
-    }
-    payload = {
-        "text": clean_text,
-        "reference_id": CONFIG.fish_audio_ram_model_id,
-        "format": "mp3",
-        "latency": "balanced",
-    }
+    models_to_try = ["s2.1-pro", "s2.1-pro-free"]
+    last_err: Exception | None = None
 
-    with httpx.Client(timeout=30.0) as client:
-        response = client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        atomic_write_audio_file(response.content)
+    for model_name in models_to_try:
+        headers = {
+            "Authorization": f"Bearer {CONFIG.fish_audio_api_key}",
+            "Content-Type": "application/json",
+            "model": model_name,
+        }
+        payload = {
+            "text": tts_text,
+            "reference_id": CONFIG.fish_audio_ram_model_id,
+            "format": "mp3",
+            "mp3_bitrate": 128,
+            "latency": "normal",
+            "temperature": 0.75,
+            "prosody": {"speed": 1.0, "volume": 0},
+            "normalize": True,
+        }
 
-    log(
-        "[Fish Audio] Audio generated successfully "
-        f"({AUDIO_FILE_PATH.name})"
-    )
+        try:
+            with httpx.Client(timeout=35.0) as client:
+                response = client.post(url, headers=headers, json=payload)
+                if response.status_code in (401, 402, 403) and model_name == "s2.1-pro":
+                    log(f"[Fish Audio WARN] Model {model_name} returned status {response.status_code}. Falling back to free tier.")
+                    continue
+                response.raise_for_status()
+                atomic_write_audio_file(response.content)
+                log(
+                    f"[Fish Audio] Audio generated successfully via {model_name} "
+                    f"with emotion={emotion!r} ({AUDIO_FILE_PATH.name})"
+                )
+                return
+        except Exception as exc:
+            last_err = exc
+            log(f"[Fish Audio WARN] Attempt with {model_name} failed: {exc}")
+
+    if last_err is not None:
+        raise last_err
 
 
 # ============================================================
@@ -741,7 +808,7 @@ def process_prompt(prompt: str) -> dict[str, Any]:
         }
 
 
-def call_gemini_audio_persona(audio_bytes: bytes) -> tuple[str, str, str]:
+def call_gemini_audio_persona(audio_bytes: bytes) -> tuple[str, str, str, str]:
     if not CONFIG.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured.")
 
@@ -767,20 +834,19 @@ def call_gemini_audio_persona(audio_bytes: bytes) -> tuple[str, str, str]:
         "   - 'SHAKE': Gentle concern, slight worry for his health, or soft decline.\n"
         "   - 'WAVE': Warm greeting, welcoming gesture, or calling attention.\n"
         "   - 'IDLE': Graceful, poised maid posture.\n"
-        "3. Formulate Ram's spoken response to Haru-sama according to the Roswaal-devoted persona:\n"
-        "   - Treat Haru-sama with the utmost devotion, loyalty, respectful affection, and gentle warmth (exactly as Ram treats Lord Roswaal in Re:Zero).\n"
-        "   - Never be abusive, cruel, rude, or dismissive.\n"
-        "   - Always address him up-front as 「ハル様、...」 (Haru-sama).\n"
-        "   - Strictly 1 concise, elegant sentence in Japanese, under 35 Japanese characters total.\n"
-        "   - Spoken dialogue only (no English words, tone labels, or explanations).\n"
-        "Output valid JSON conforming to the schema with properties 'transcript', 'motion', and 'reply'."
+        "3. Select an emotion delivery tag in 'emotion': 'gentle', 'affectionate', 'teasing', 'soft voice', 'sigh', or 'calm'.\n"
+        "4. Formulate Ram's spoken response to Haru-sama with authentic Re:Zero charm:\n"
+        "   - Treat Haru-sama with deep loyalty, gentle warmth, and lively anime nuance (soft chuckles, fond teasing).\n"
+        "   - Do NOT rigidly start every sentence with 「ハル様、」. Place his name naturally.\n"
+        "   - Strictly 1 concise sentence in Japanese, under 40 Japanese characters total.\n"
+        "Output valid JSON conforming to the schema with 'transcript', 'motion', 'emotion', and 'reply'."
     )
 
     generate_config_cls = getattr(types, "GenerateContentConfig", None)
     config = (
         generate_config_cls(
             system_instruction=RAM_SYSTEM_INSTRUCTION,
-            temperature=0.7,
+            temperature=0.85,
             max_output_tokens=150,
             response_mime_type="application/json",
             response_schema=UNIFIED_AUDIO_PERSONA_SCHEMA,
@@ -817,6 +883,7 @@ def call_gemini_audio_persona(audio_bytes: bytes) -> tuple[str, str, str]:
             parsed = parse_json_safely(raw_text)
             transcript = str(parsed.get("transcript", "")).strip()
             motion = str(parsed.get("motion", "IDLE")).strip().upper()
+            emotion = str(parsed.get("emotion", "gentle")).strip()
             reply = str(parsed.get("reply", "")).strip()
 
             clean_reply = re.sub(r"\[.*?\]", "", reply).strip() or reply
@@ -827,9 +894,9 @@ def call_gemini_audio_persona(audio_bytes: bytes) -> tuple[str, str, str]:
             if motion not in {"TILT", "NOD", "SHAKE", "WAVE", "BOW", "IDLE"}:
                 motion = "IDLE"
 
-            log(f"[SinglePass SUCCESS] Transcript: {transcript!r} | Motion: {motion} | Reply: {clean_reply!r}")
+            log(f"[SinglePass SUCCESS] Transcript: {transcript!r} | Motion: {motion} | Emotion: {emotion} | Reply: {clean_reply!r}")
             speech_state.last_gemini_error = ""
-            return transcript, motion, clean_reply
+            return transcript, motion, emotion, clean_reply
         except Exception as exc:
             last_error = exc
             log(f"[SinglePass WARN] Model {model_name} failed: {exc}")
@@ -839,14 +906,16 @@ def call_gemini_audio_persona(audio_bytes: bytes) -> tuple[str, str, str]:
     transcript = transcribe_audio(audio_bytes) or "（ハル様がお話しになりました）"
     reply = call_gemini(transcript)
     clean_reply = re.sub(r"\[.*?\]", "", reply).strip() or reply
-    return transcript, "IDLE", clean_reply
+    return transcript, "IDLE", "gentle", clean_reply
 
 
 def call_gemini_vision_audio_persona(
     image_bytes: bytes,
     audio_bytes: bytes | None = None,
     text_prompt: str | None = None,
-) -> tuple[str, str, str]:
+    identity: str = "HARU",
+    similarity: float = 0.0,
+) -> tuple[str, str, str, str]:
     if not CONFIG.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured.")
 
@@ -865,29 +934,35 @@ def call_gemini_vision_audio_persona(
         processed_audio = normalize_and_convert_mono(audio_bytes)
         audio_part = types.Part.from_bytes(data=processed_audio, mime_type="audio/wav")
         contents.append(audio_part)
+
+    if identity == "STRANGER":
         vision_prompt = (
-            "You are observing your beloved creator and master, Haru (ハル様), through your desktop robot's camera and listening to his voice.\n"
-            "1. Transcribe Haru-sama's spoken words verbatim in their original language. If inaudible or silent, set transcript to \"\".\n"
+            f"CRITICAL INTRUDER ALERT: Facial verification confirms the person standing in front of your desktop robot is NOT Haru-sama! "
+            f"(Similarity score: {similarity:.2f} < 0.38 match threshold). This person is an UNKNOWN STRANGER or IMPOSTOR who may be trying to touch Haru's things or take his seat!\n"
+            "1. Transcribe any spoken words heard in audio. If silent, set transcript to \"\".\n"
             "2. Select an animatronic robot gesture for Ram in 'motion':\n"
-            "   - 'BOW': Respectful, elegant maid bow when greeting, welcoming home, thanking, or receiving an instruction from Haru-sama.\n"
-            "   - 'TILT': Inquisitive, affectionate, or gentle head tilt.\n"
-            "   - 'NOD': Respectful acknowledgment, affirmation, or polite agreement.\n"
-            "   - 'SHAKE': Gentle concern, slight worry for his health, or soft decline.\n"
-            "   - 'WAVE': Warm greeting, welcoming gesture, or calling attention.\n"
-            "   - 'IDLE': Graceful, poised maid posture.\n"
-            "3. Observe Haru-sama's expression, posture, clothing, objects held, or desk workspace with warm, devoted attentiveness.\n"
-            "4. Generate Ram's spoken response: devoted, polite, caring, and graceful (treating Haru-sama with the same deep affection and reverence Ram shows to Lord Roswaal). "
-            "Always address him as 「ハル様、...」. Strictly 1 concise sentence in Japanese, under 40 Japanese characters total.\n"
-            "Output valid JSON conforming to the schema with 'transcript', 'motion', and 'reply'."
+            "   - 'SHAKE': Disapproval / rejection head shake.\n"
+            "   - 'TILT': Suspicious, critical, narrowed-eyes head tilt.\n"
+            "   - 'IDLE': Cold, haughty posture.\n"
+            "3. Select an emotion delivery tag in 'emotion': 'cold', 'suspicious', 'haughty', or 'stern'.\n"
+            "4. React to this stranger with Ram's authentic Re:Zero personality:\n"
+            "   - You are fiercely loyal to Haru-sama and protective of his workspace.\n"
+            "   - Be cold, suspicious, and tsundere. You look down on them.\n"
+            "   - NEVER call them 'ハル様'! Demand to know who they are, why they are at Haru-sama's desk, and where Haru-sama is.\n"
+            "   - Strictly 1 concise sentence in Japanese, under 40 Japanese characters total.\n"
+            "Output valid JSON conforming to the schema with 'transcript', 'motion', 'emotion', and 'reply'."
         )
     else:
         vision_prompt = (
-            f"Context: {text_prompt or 'Haru-sama is showing himself or his workspace to Ram'}\n"
-            "1. Select an animatronic robot gesture for Ram in 'motion': 'BOW', 'TILT', 'NOD', 'SHAKE', 'WAVE', or 'IDLE'.\n"
-            "2. Observe Haru-sama and his workspace with warm, devoted attentiveness.\n"
-            "3. Generate Ram's spoken response: devoted, caring, graceful, and lovingly attentive. "
-            "Address him as 「ハル様、...」. Strictly 1 concise sentence in Japanese, under 40 Japanese characters total.\n"
-            "Output valid JSON conforming to the schema with 'transcript', 'motion', and 'reply'."
+            f"Context: {text_prompt or 'Haru-sama is interacting with Ram through his desktop companion camera'}\n"
+            "The person before you is Haru-sama (ハル様), your beloved creator and master.\n"
+            "1. Transcribe any spoken words heard in audio. If silent, set transcript to \"\".\n"
+            "2. Select an animatronic robot gesture for Ram in 'motion': 'BOW', 'TILT', 'NOD', 'WAVE', or 'IDLE'.\n"
+            "3. Select an emotion delivery tag in 'emotion': 'gentle', 'affectionate', 'teasing', or 'calm'.\n"
+            "4. Generate Ram's spoken response: devoted, caring, graceful, and lovingly attentive with authentic Re:Zero charm "
+            "(natural anime nuance, soft chuckles, pauses, fond teasing; do NOT rigidly prepend 'ハル様、').\n"
+            "Strictly 1 concise sentence in Japanese, under 40 Japanese characters total.\n"
+            "Output valid JSON conforming to the schema with 'transcript', 'motion', 'emotion', and 'reply'."
         )
 
     contents.append(vision_prompt)
@@ -896,7 +971,7 @@ def call_gemini_vision_audio_persona(
     config = (
         generate_config_cls(
             system_instruction=RAM_SYSTEM_INSTRUCTION,
-            temperature=0.75,
+            temperature=0.85,
             max_output_tokens=150,
             response_mime_type="application/json",
             response_schema=UNIFIED_AUDIO_PERSONA_SCHEMA,
@@ -916,7 +991,7 @@ def call_gemini_vision_audio_persona(
 
     for model_name in models_to_try:
         try:
-            log(f"[Vision SinglePass] Requesting {model_name}...")
+            log(f"[Vision SinglePass] Requesting {model_name} (identity={identity})...")
             response = client.models.generate_content(
                 model=model_name,
                 contents=contents,
@@ -928,24 +1003,26 @@ def call_gemini_vision_audio_persona(
             parsed = parse_json_safely(raw_text)
             transcript = str(parsed.get("transcript", "")).strip()
             motion = str(parsed.get("motion", "IDLE")).strip().upper()
+            emotion = str(parsed.get("emotion", "cold" if identity == "STRANGER" else "gentle")).strip()
             reply = str(parsed.get("reply", "")).strip()
 
             clean_reply = re.sub(r"\[.*?\]", "", reply).strip() or reply
             if not clean_reply:
-                clean_reply = "ハル様のお姿、ラムのこの目でしっかりと見つめておりますわ。"
+                clean_reply = "……どちら様かしら？ ハル様の席から離れてくださる？" if identity == "STRANGER" else "ハル様のお姿、ラムのこの目でしっかりと見つめておりますわ。"
             if not transcript and text_prompt:
                 transcript = text_prompt
             if motion not in {"TILT", "NOD", "SHAKE", "WAVE", "BOW", "IDLE"}:
-                motion = "IDLE"
+                motion = "SHAKE" if identity == "STRANGER" else "IDLE"
 
-            log(f"[Vision SinglePass SUCCESS] Transcript: {transcript!r} | Motion: {motion} | Reply: {clean_reply!r}")
-            return transcript, motion, clean_reply
+            log(f"[Vision SinglePass SUCCESS] Transcript: {transcript!r} | Motion: {motion} | Emotion: {emotion} | Reply: {clean_reply!r}")
+            return transcript, motion, emotion, clean_reply
         except Exception as exc:
             log(f"[Vision SinglePass WARN] Model {model_name} failed: {exc}")
             time.sleep(0.3)
 
     log("[Vision SinglePass ERROR] All models failed. Using default fallback.")
-    return text_prompt or "(視覚観察)", "IDLE", "ハル様のお姿、ラムのこの目でしっかりと見つめておりますわ。"
+    fallback_reply = "……どちら様かしら？ ハル様の席から離れてくださる？" if identity == "STRANGER" else "ハル様のお姿、ラムのこの目でしっかりと見つめておりますわ。"
+    return text_prompt or "(視覚観察)", "SHAKE" if identity == "STRANGER" else "IDLE", "cold" if identity == "STRANGER" else "gentle", fallback_reply
 
 
 def process_voice_prompt(audio_bytes: bytes) -> dict[str, Any]:
@@ -953,17 +1030,26 @@ def process_voice_prompt(audio_bytes: bytes) -> dict[str, Any]:
         raise ValueError("Missing audio data.")
 
     with process_lock:
-        transcript, motion, japanese_reply = call_gemini_audio_persona(audio_bytes)
-        call_fish_audio(japanese_reply)
-        snapshot = speech_state.queue_new_audio(japanese_reply, motion=motion)
+        transcript, motion, emotion, japanese_reply = call_gemini_audio_persona(audio_bytes)
+        clean_reply = re.sub(r"\[.*?\]", "", japanese_reply).strip() or japanese_reply
+        call_fish_audio(clean_reply, emotion=emotion)
+        snapshot = speech_state.queue_new_audio(
+            clean_reply,
+            motion=motion,
+            identity="HARU",
+            similarity=1.0,
+        )
         log(f"[Server] Voice audio queued seq={snapshot['seq']} motion={motion} for transcript={transcript!r}")
         return {
             "ok": True,
             "seq": snapshot["seq"],
             "transcript": transcript,
             "motion": motion,
-            "reply": japanese_reply,
-            "text": japanese_reply,
+            "emotion": emotion,
+            "identity": "HARU",
+            "similarity": 1.0,
+            "reply": clean_reply,
+            "text": clean_reply,
             "audio_url": snapshot["audio_url"],
         }
 
@@ -978,22 +1064,37 @@ def process_vision_prompt(
 
     log(f"[Vision] Processing image ({len(image_bytes)} bytes)...")
 
+    # 1:1 Face Verification Gate
+    identity, similarity = face_verifier.verify_face(image_bytes)
+    log(f"[Vision Gate] Face verified: identity={identity} (similarity={similarity:.3f})")
+
     with process_lock:
-        transcript, motion, japanese_reply = call_gemini_vision_audio_persona(
+        transcript, motion, emotion, japanese_reply = call_gemini_vision_audio_persona(
             image_bytes=image_bytes,
             audio_bytes=audio_bytes,
             text_prompt=text_prompt,
+            identity=identity,
+            similarity=similarity,
         )
-        call_fish_audio(japanese_reply)
-        snapshot = speech_state.queue_new_audio(japanese_reply, motion=motion)
-        log(f"[Server] Vision audio queued seq={snapshot['seq']} motion={motion}")
+        clean_reply = re.sub(r"\[.*?\]", "", japanese_reply).strip() or japanese_reply
+        call_fish_audio(clean_reply, emotion=emotion)
+        snapshot = speech_state.queue_new_audio(
+            clean_reply,
+            motion=motion,
+            identity=identity,
+            similarity=similarity,
+        )
+        log(f"[Server] Vision audio queued seq={snapshot['seq']} motion={motion} identity={identity}")
         return {
             "ok": True,
             "seq": snapshot["seq"],
             "transcript": transcript,
             "motion": motion,
-            "reply": japanese_reply,
-            "text": japanese_reply,
+            "emotion": emotion,
+            "identity": identity,
+            "similarity": round(similarity, 3),
+            "reply": clean_reply,
+            "text": clean_reply,
             "audio_url": snapshot["audio_url"],
         }
 
@@ -1284,6 +1385,70 @@ class RamRequestHandler(BaseHTTPRequestHandler):
 
         write_json(self, HTTPStatus.OK, result)
 
+    def _read_image_bytes(self) -> bytes:
+        content_length = int(self.headers.get("Content-Length", "0") or "0")
+        if not content_length:
+            raise ValueError("Payload is empty.")
+
+        content_type = self.headers.get("Content-Type", "")
+        raw_body = self.rfile.read(content_length)
+
+        if "multipart/form-data" in content_type.lower():
+            boundary = ""
+            for param in content_type.split(";"):
+                param = param.strip()
+                if param.lower().startswith("boundary="):
+                    boundary = param.split("=", 1)[1].strip('"\' ')
+            if boundary:
+                boundary_bytes = boundary.encode("latin1")
+                parts = raw_body.split(b"--" + boundary_bytes)
+                for part in parts:
+                    if b"\r\n\r\n" not in part:
+                        continue
+                    header_chunk, body_chunk = part.split(b"\r\n\r\n", 1)
+                    if body_chunk.endswith(b"\r\n"):
+                        body_chunk = body_chunk[:-2]
+                    header_chunk_lower = header_chunk.lower()
+                    if b'name="image"' in header_chunk_lower or (
+                        b"filename=" in header_chunk_lower
+                        and (b".jpg" in header_chunk_lower or b".jpeg" in header_chunk_lower or b".png" in header_chunk_lower)
+                    ):
+                        return body_chunk
+        elif "application/json" in content_type.lower():
+            import base64
+            payload = json.loads(raw_body.decode("utf-8"))
+            img_b64 = payload.get("image") or payload.get("image_base64", "")
+            if img_b64:
+                return base64.b64decode(img_b64)
+        return raw_body
+
+    def _handle_enroll_submission(self) -> None:
+        try:
+            image_bytes = self._read_image_bytes()
+        except Exception as exc:
+            write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"Failed to read image: {exc}"})
+            return
+
+        if not image_bytes:
+            write_json(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "No image data provided for enrollment."})
+            return
+
+        ok, msg, count = face_verifier.enroll_face(image_bytes)
+        if ok:
+            speech_state.last_identity = "HARU"
+            write_json(self, HTTPStatus.OK, {
+                "ok": True,
+                "enrolled": True,
+                "num_enrolled": count,
+                "message": msg,
+            })
+        else:
+            write_json(self, HTTPStatus.BAD_REQUEST, {
+                "ok": False,
+                "enrolled": False,
+                "error": msg,
+            })
+
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -1329,6 +1494,15 @@ class RamRequestHandler(BaseHTTPRequestHandler):
             self._send_ack()
             return
 
+        if route_path in {"/enroll/status", "/api/enroll/status"}:
+            write_json(self, HTTPStatus.OK, {
+                "ok": True,
+                "num_enrolled": face_verifier.num_enrolled,
+                "last_identity": speech_state.last_identity,
+                "last_similarity": speech_state.last_similarity,
+            })
+            return
+
         if route_path == "/models":
             if not self._require_chat_token(self._route_query()):
                 return
@@ -1351,6 +1525,20 @@ class RamRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         route_path = self._route_path()
+
+        if route_path in {"/enroll", "/api/enroll"}:
+            if not self._require_chat_token(self._route_query()):
+                return
+            self._handle_enroll_submission()
+            return
+
+        if route_path in {"/enroll/clear", "/api/enroll/clear"}:
+            if not self._require_chat_token(self._route_query()):
+                return
+            count = face_verifier.clear_enrolled()
+            speech_state.last_identity = "NOT_ENROLLED"
+            write_json(self, HTTPStatus.OK, {"ok": True, "cleared": count})
+            return
 
         if route_path in {"/voice-chat", "/voice"}:
             if not self._require_chat_token(self._route_query()):

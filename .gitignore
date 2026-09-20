@@ -5,3 +5,5 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 static/ram_speech.mp3
+models/*.onnx
+data/
