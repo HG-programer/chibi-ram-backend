@@ -135,6 +135,11 @@ class FaceVerifier:
                 return None, "Failed to decode image bytes"
 
             h, w, _ = img.shape
+            if max(h, w) > 1280:
+                scale = 1280.0 / max(h, w)
+                img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+                h, w, _ = img.shape
+
             self.detector.setInputSize((w, h))
             _, faces = self.detector.detect(img)
 
